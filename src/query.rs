@@ -13,7 +13,7 @@
 //! is what makes the engine testable (property tests below) and what makes a dropped shard safely
 //! retryable on another host — re-running a map is free of side effects.
 
-use crate::combine::{Accum, Partial};
+use crate::combine::{Accum, GroupResult, Partial};
 use crate::dataset::Row;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -158,8 +158,43 @@ impl Agg {
     }
 }
 
-/// A full query: aggregates over a dataset, filtered and grouped. Built with the fluent methods or
-/// parsed from SQL ([`crate::sql::parse`]).
+/// Sort direction for an [`OrderKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderDir {
+    /// Ascending (`ASC`, the default).
+    Asc,
+    /// Descending (`DESC`).
+    Desc,
+}
+
+/// One `ORDER BY` key: the name of an output column (a group key column or an aggregate output name
+/// such as `count` / `sum_amount`) and the direction to sort it.
+///
+/// Ordering is applied **after** the reduce/finalise step, over the [`GroupResult`] rows — it is a
+/// pure post-processing shape on the (already small) result set, not a distributed concern. A key
+/// that names neither a group column nor an aggregate output sorts every row equal (a no-op rather
+/// than an error), so a typo never panics; callers can validate against the schema if they wish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderKey {
+    /// The output column to sort by (group key column or aggregate output name).
+    pub column: String,
+    /// Ascending or descending.
+    pub dir: OrderDir,
+}
+
+impl OrderKey {
+    /// An ascending order key on `column`.
+    pub fn asc(column: impl Into<String>) -> OrderKey {
+        OrderKey { column: column.into(), dir: OrderDir::Asc }
+    }
+    /// A descending order key on `column`.
+    pub fn desc(column: impl Into<String>) -> OrderKey {
+        OrderKey { column: column.into(), dir: OrderDir::Desc }
+    }
+}
+
+/// A full query: aggregates over a dataset, filtered and grouped, then ordered and limited. Built
+/// with the fluent methods or parsed from SQL ([`crate::sql::parse`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Query {
     /// Dataset (table) name the query reads.
@@ -172,6 +207,13 @@ pub struct Query {
     /// Group-by key columns (empty = single global group).
     #[serde(default)]
     pub group_by: Vec<String>,
+    /// `ORDER BY` keys, applied left-to-right to the finalised result rows (empty = keep the engine's
+    /// natural by-group-key order).
+    #[serde(default)]
+    pub order_by: Vec<OrderKey>,
+    /// `LIMIT` — keep at most this many result rows after ordering (`None` = unlimited).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 impl Query {
@@ -182,6 +224,8 @@ impl Query {
             aggregates: Vec::new(),
             predicate: Predicate::True,
             group_by: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
         }
     }
 
@@ -201,6 +245,29 @@ impl Query {
     pub fn group(mut self, key: impl Into<String>) -> Query {
         self.group_by.push(key.into());
         self
+    }
+
+    /// Add an `ORDER BY` key (builder). Keys apply left-to-right (the first is the primary sort).
+    pub fn order(mut self, key: OrderKey) -> Query {
+        self.order_by.push(key);
+        self
+    }
+
+    /// Set the `LIMIT` (builder): keep at most `n` result rows after ordering.
+    pub fn limit(mut self, n: usize) -> Query {
+        self.limit = Some(n);
+        self
+    }
+
+    /// Apply this query's `ORDER BY` and `LIMIT` to a finalised result set, returning the shaped
+    /// rows. Pure: ordering is a stable multi-key sort (see [`crate::order::order_rows`]) followed by
+    /// a `LIMIT` truncation. With neither clause this is the identity (the engine's natural order is
+    /// preserved). Called by the engine after the reduce, so it works identically for local and
+    /// distributed runs.
+    pub fn shape(&self, mut rows: Vec<GroupResult>) -> Vec<GroupResult> {
+        crate::order::order_rows(&mut rows, &self.group_by, &self.order_by);
+        crate::order::apply_limit(&mut rows, self.limit);
+        rows
     }
 
     /// Validate the query is runnable: it must request at least one aggregate. (A projection-only
@@ -392,5 +459,43 @@ mod tests {
         assert_eq!(Agg::Count.output_name(), "count");
         assert_eq!(Agg::Sum("x".into()).output_name(), "sum_x");
         assert_eq!(Agg::Avg("y".into()).output_name(), "avg_y");
+    }
+
+    #[test]
+    fn builder_order_and_limit() {
+        let q = Query::new("t")
+            .agg(Agg::Count)
+            .group("g")
+            .order(OrderKey::desc("count"))
+            .order(OrderKey::asc("g"))
+            .limit(7);
+        assert_eq!(q.order_by, vec![OrderKey::desc("count"), OrderKey::asc("g")]);
+        assert_eq!(q.limit, Some(7));
+    }
+
+    #[test]
+    fn shape_orders_then_limits() {
+        // shape() must order before truncating: top-2 by count desc.
+        let q = Query::new("t").agg(Agg::Count).group("g").order(OrderKey::desc("count")).limit(2);
+        let make = |k: &str, c: i64| crate::combine::GroupResult {
+            key: vec![k.into()],
+            values: [("count".to_string(), json!(c))].into_iter().collect(),
+        };
+        let out = q.shape(vec![make("a", 3), make("b", 9), make("c", 1)]);
+        let keys: Vec<&str> = out.iter().map(|g| g.key[0].as_str()).collect();
+        assert_eq!(keys, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn query_serde_roundtrip_with_order_limit() {
+        let q = Query::new("t").agg(Agg::Count).group("g").order(OrderKey::asc("g")).limit(5);
+        let json = serde_json::to_string(&q).unwrap();
+        let back: Query = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, q);
+        // Older payloads without order_by/limit still deserialize (serde default).
+        let legacy = r#"{"dataset":"t","aggregates":["Count"],"group_by":["g"]}"#;
+        let q2: Query = serde_json::from_str(legacy).unwrap();
+        assert!(q2.order_by.is_empty());
+        assert_eq!(q2.limit, None);
     }
 }

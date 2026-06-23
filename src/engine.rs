@@ -105,7 +105,7 @@ pub async fn run(
         // A dataset with no shards yields the empty result (a single global group is *not* implied —
         // there are zero rows). Finalising an empty partial gives an empty group set.
         return Ok(RunReport {
-            results: Partial::empty(query.aggregates.clone()).finalize(),
+            results: query.shape(Partial::empty(query.aggregates.clone()).finalize()),
             served_by: BTreeMap::new(),
             total_attempts: 0,
             redistributed: 0,
@@ -166,7 +166,9 @@ pub async fn run(
     }
 
     let merged = combine::reduce(query.aggregates.clone(), partials);
-    Ok(RunReport { results: merged.finalize(), served_by, total_attempts, redistributed })
+    // Apply ORDER BY / LIMIT once, after the distributed reduce, over the small result set.
+    let results = query.shape(merged.finalize());
+    Ok(RunReport { results, served_by, total_attempts, redistributed })
 }
 
 #[cfg(test)]
@@ -390,6 +392,37 @@ mod tests {
         // Exactly 2 attempts were made for the single shard despite 5 candidate hosts.
         let total: usize = h.iter().map(|hh| host.call_count(hh, &shards[0].cid)).sum();
         assert_eq!(total, 2, "attempt cap must bound retries");
+    }
+
+    #[tokio::test]
+    async fn order_by_and_limit_applied_to_run_report() {
+        use crate::query::OrderKey;
+        // Group by parity, sum v per group, then ORDER BY sum_v DESC LIMIT 1 over the result rows.
+        let rows: Vec<Row> = (1..=10).map(row).collect(); // odds sum 25, evens sum 30
+        let (shards, store) = make_dataset(&rows, 4);
+        let host = MockHost::new(store);
+        // A group key derived from parity via a string column.
+        let parity_rows: Vec<Row> = (1..=10)
+            .map(|v| {
+                [("v".to_string(), json!(v)), ("p".to_string(), json!(if v % 2 == 0 { "even" } else { "odd" }))]
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let (shards2, store2) = make_dataset(&parity_rows, 4);
+        let host2 = MockHost::new(store2);
+        let _ = (shards, host); // first dataset unused; keep the helper exercised
+
+        let q = Query::new("t")
+            .agg(Agg::Sum("v".into()))
+            .group("p")
+            .order(OrderKey::desc("sum_v"))
+            .limit(1);
+        let report = run(&q, &shards2, &hosts(3), &host2, &RunConfig::default()).await.unwrap();
+        // Only the top group by sum_v survives the LIMIT 1: evens (30) beat odds (25).
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].key[0], "even");
+        assert_eq!(report.results[0].values["sum_v"], json!(30.0));
     }
 
     #[tokio::test]

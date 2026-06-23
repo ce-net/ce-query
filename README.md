@@ -52,7 +52,8 @@ The map/host seam is the `engine::MapHost` trait, with two implementations:
 A builder API and an equivalent SQL-ish front end:
 
 ```text
-SELECT <agg> [, <agg>]* FROM <dataset> [WHERE <pred>] [GROUP BY <col> [, <col>]*]
+SELECT <agg> [, <agg>]* FROM <dataset> [WHERE <pred>]
+       [GROUP BY <col> [, <col>]*] [ORDER BY <col> [ASC|DESC] [, ...]] [LIMIT <n>]
 <agg>   := COUNT(*) | SUM(col) | MIN(col) | MAX(col) | AVG(col)
 <pred>  := <term> [ (AND|OR) <term> ]*
 <term>  := [NOT] col <op> <literal>
@@ -62,8 +63,25 @@ SELECT <agg> [, <agg>]* FROM <dataset> [WHERE <pred>] [GROUP BY <col> [, <col>]*
 
 `AVG` is carried as `(sum, count)` and divided only at finalisation, so it stays a monoid (averaging
 averages would be wrong; merging sums and counts then dividing is right). Non-numeric / missing cells
-are skipped for numeric aggregates, so one bad value never corrupts a result. No joins, subqueries,
-`HAVING`, or `ORDER BY` — this is the aggregate-first map-reduce core.
+are skipped for numeric aggregates, so one bad value never corrupts a result.
+
+`ORDER BY` keys name an output column — a group-key column or an aggregate output name (`count`,
+`sum_amount`, …) — and `LIMIT` keeps the top-N. Both are applied **once, after the distributed
+reduce**, over the (already small) result rows, so they cost nothing on the map side and behave
+identically for the local and mesh-distributed engines.
+
+**Equi-joins across two datasets** live in the `join` module (a separate entry point, not the SQL
+front end): an inner hash-join on a key pair, plus a **co-partitioned** `distributed_join` that hashes
+both sides into the same buckets so each bucket pair joins independently (the map-reduce shape for
+joins). A joined row stream feeds straight back into the aggregate engine, so `JOIN … GROUP BY …` is
+`distributed_join(...)` followed by `map_shard`.
+
+```rust
+use ce_query::{hash_join, distributed_join, JoinKeys};
+let joined = distributed_join(&users, &orders, &JoinKeys::on("uid"), 8); // co-partitioned
+```
+
+Subqueries and `HAVING` remain out of scope — this is the aggregate-first map-reduce core.
 
 ```rust
 use ce_query::{Query, query::Agg, sql};
@@ -119,8 +137,10 @@ dataset scope. A holder can attenuate (narrow to one dataset, add an expiry) and
 | Module | Responsibility |
 |---|---|
 | `dataset` | Dataset model, NDJSON shard encode/decode, round-robin sharding |
-| `query` | The query model + the pure **map** (`map_shard`), predicate/aggregate evaluation |
+| `query` | The query model + the pure **map** (`map_shard`), predicate/aggregate evaluation, `ORDER BY`/`LIMIT` shaping |
 | `combine` | The monoid algebra: `Accum`, `Partial`, associative+commutative `merge`, `reduce`, finalisation |
+| `order` | `ORDER BY` (stable, total, type-aware multi-key sort) + `LIMIT` over the finalised rows |
+| `join` | Inner equi-join across two datasets: in-memory `hash_join` + co-partitioned `distributed_join` |
 | `plan` | Rendezvous-hash shard→host assignment + deterministic failover ranking |
 | `engine` | The distributed executor: fan map tasks, retry/redistribute on drop, reduce |
 | `mesh` | `MapHost` implementations over `ce-rs` (`LocalMapHost`, `MeshMapHost`) + the on-host `serve_map` |
@@ -138,13 +158,17 @@ The pure planning/combining core is the foundation, so it is validated from the 
     answer as mapping them whole;
   - the empty/identity partial is **harmless** under arbitrary insertion order (safe retry);
   - a `Partial` survives a **JSON round-trip** unchanged (the mesh wire form);
-  - rendezvous placement is **balanced**, and dropping one host **re-homes only its shards**.
+  - rendezvous placement is **balanced**, and dropping one host **re-homes only its shards**;
+  - **`ORDER BY` + `LIMIT`** — ordering is a sorted permutation, and `LIMIT n` is exactly the first
+    `n` of the full order (no reordering leak);
+  - **joins** — the co-partitioned `distributed_join` equals the single-pass `hash_join` for any
+    partition count, and an equi-join emits the textbook `Σ countL(k)·countR(k)` cardinality.
 - **Failure injection** in `engine` via a mock `MapHost`: dropped peers, transient 5xx, missing
   blobs, attempt caps, no-hosts, empty datasets, and an invalid query — every path returns a clear
   error or a correct redistributed result, and **never panics**.
 
 ```bash
-cargo test          # 73 unit/integration tests + 1 doctest, all green
+cargo test          # 109 unit/integration tests + 1 doctest, all green
 cargo clippy --all-targets   # zero warnings
 ```
 

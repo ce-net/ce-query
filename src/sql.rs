@@ -5,7 +5,8 @@
 //! one-to-one onto a runnable plan. Supported grammar (case-insensitive keywords):
 //!
 //! ```text
-//! SELECT <agg> [, <agg>]* FROM <dataset> [WHERE <pred>] [GROUP BY <col> [, <col>]*]
+//! SELECT <agg> [, <agg>]* FROM <dataset> [WHERE <pred>]
+//!        [GROUP BY <col> [, <col>]*] [ORDER BY <col> [ASC|DESC] [, ...]] [LIMIT <n>]
 //! <agg>   := COUNT(*) | SUM(col) | MIN(col) | MAX(col) | AVG(col)
 //! <pred>  := <term> [ (AND|OR) <term> ]*        (left-assoc; AND/OR same precedence here)
 //! <term>  := [NOT] col <op> <literal>
@@ -13,11 +14,13 @@
 //! <literal> := number | 'single-quoted string' | "double-quoted string" | true | false | null
 //! ```
 //!
-//! It does **not** support joins, subqueries, projections of raw columns, or `HAVING`/`ORDER BY` —
-//! those are out of scope for the map-reduce core. Any unsupported syntax is a clear error (never a
+//! `ORDER BY` keys name an output column — a group-key column or an aggregate output name (`count`,
+//! `sum_amount`, ...) — and apply after the reduce; `LIMIT` keeps the top-N of that order. The parser
+//! still does **not** support joins (a separate [`crate::join`] entry point handles those),
+//! subqueries, raw-column projections, or `HAVING`. Any unsupported syntax is a clear error (never a
 //! panic), so the CLI can surface it. The parser is pure and fully unit-tested.
 
-use crate::query::{Agg, CmpOp, Predicate, Query};
+use crate::query::{Agg, CmpOp, OrderDir, OrderKey, Predicate, Query};
 use anyhow::{Result, anyhow, bail};
 
 /// Parse a SQL-ish query string into a [`Query`]. Errors carry a human-readable reason.
@@ -171,7 +174,54 @@ impl Parser {
             }
         }
 
-        Ok(Query { dataset, aggregates, predicate, group_by })
+        let order_by = if self.is_kw("ORDER") {
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
+
+        let limit = if self.is_kw("LIMIT") {
+            Some(self.parse_limit()?)
+        } else {
+            None
+        };
+
+        Ok(Query { dataset, aggregates, predicate, group_by, order_by, limit })
+    }
+
+    /// Parse `ORDER BY <col> [ASC|DESC] [, <col> [ASC|DESC]]*`. Direction defaults to ascending.
+    fn parse_order_by(&mut self) -> Result<Vec<OrderKey>> {
+        self.expect_kw("ORDER")?;
+        self.expect_kw("BY")?;
+        let mut keys = Vec::new();
+        loop {
+            let column = self
+                .next_word()
+                .ok_or_else(|| anyhow!("expected a column after ORDER BY"))?;
+            let dir = if self.is_kw("ASC") {
+                self.expect_kw("ASC")?;
+                OrderDir::Asc
+            } else if self.is_kw("DESC") {
+                self.expect_kw("DESC")?;
+                OrderDir::Desc
+            } else {
+                OrderDir::Asc
+            };
+            keys.push(OrderKey { column, dir });
+            if self.peek().map(|w| w == ",").unwrap_or(false) {
+                self.pos += 1; // consume comma
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Parse `LIMIT <non-negative integer>`. A non-integer or negative value is a clear error.
+    fn parse_limit(&mut self) -> Result<usize> {
+        self.expect_kw("LIMIT")?;
+        let w = self.next_word().ok_or_else(|| anyhow!("expected a number after LIMIT"))?;
+        w.parse::<usize>().map_err(|_| anyhow!("LIMIT must be a non-negative integer, got `{w}`"))
     }
 
     /// Consume a bare word (identifier/number), not an operator/string. None otherwise.
@@ -435,5 +485,62 @@ mod tests {
             Predicate::Cmp { value, .. } => assert_eq!(value, json!("alice")),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parse_order_by_default_asc() {
+        let q = parse("SELECT COUNT(*) FROM t GROUP BY g ORDER BY count").unwrap();
+        assert_eq!(q.order_by, vec![OrderKey::asc("count")]);
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn parse_order_by_desc_and_limit() {
+        let q = parse("SELECT SUM(amount) FROM sales GROUP BY region ORDER BY sum_amount DESC LIMIT 5")
+            .unwrap();
+        assert_eq!(q.order_by, vec![OrderKey::desc("sum_amount")]);
+        assert_eq!(q.limit, Some(5));
+    }
+
+    #[test]
+    fn parse_order_by_multiple_keys() {
+        let q = parse("SELECT COUNT(*) FROM t GROUP BY a, b ORDER BY a ASC, count DESC").unwrap();
+        assert_eq!(q.order_by, vec![OrderKey::asc("a"), OrderKey::desc("count")]);
+    }
+
+    #[test]
+    fn parse_limit_without_order() {
+        let q = parse("SELECT COUNT(*) FROM t LIMIT 3").unwrap();
+        assert!(q.order_by.is_empty());
+        assert_eq!(q.limit, Some(3));
+    }
+
+    #[test]
+    fn parse_limit_zero_is_valid() {
+        let q = parse("SELECT COUNT(*) FROM t LIMIT 0").unwrap();
+        assert_eq!(q.limit, Some(0));
+    }
+
+    #[test]
+    fn order_by_and_limit_errors_are_graceful() {
+        assert!(parse("SELECT COUNT(*) FROM t ORDER BY").is_err()); // no column
+        assert!(parse("SELECT COUNT(*) FROM t LIMIT").is_err()); // no number
+        assert!(parse("SELECT COUNT(*) FROM t LIMIT abc").is_err()); // non-numeric
+        assert!(parse("SELECT COUNT(*) FROM t LIMIT -1").is_err()); // negative
+        assert!(parse("SELECT COUNT(*) FROM t ORDER BY count SIDEWAYS").is_err()); // trailing junk
+    }
+
+    #[test]
+    fn full_query_with_all_clauses() {
+        let q = parse(
+            "SELECT SUM(amount), COUNT(*) FROM sales WHERE region = 'EU' \
+             GROUP BY product ORDER BY count DESC LIMIT 10",
+        )
+        .unwrap();
+        assert_eq!(q.dataset, "sales");
+        assert_eq!(q.aggregates, vec![Agg::Sum("amount".into()), Agg::Count]);
+        assert_eq!(q.group_by, vec!["product".to_string()]);
+        assert_eq!(q.order_by, vec![OrderKey::desc("count")]);
+        assert_eq!(q.limit, Some(10));
     }
 }
