@@ -1,0 +1,47 @@
+[package]
+name = "ce-query"
+version = "0.1.0"
+edition = "2024"
+description = "Distributed query / map-reduce engine (BigQuery-shaped) over CE content-addressed blob datasets — register sharded datasets, fan map tasks across atlas hosts, reduce partial aggregates. An application built ON CE primitives, not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-query"
+keywords = ["ce", "bigquery", "map-reduce", "analytics", "p2p"]
+categories = ["command-line-utilities", "database"]
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+
+# ce-query is both a reusable library (dataset model, query plan/shard assignment, the
+# map/reduce combiner algebra, the SQL-ish parser, capability scoping) and the `ce-query` CLI
+# binary over it. The pure planning/combining core is exhaustively unit- and property-tested; the
+# distributed engine that fans tasks over the mesh is failure-injection-tested with a mock host.
+[lib]
+name = "ce_query"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-query"
+path = "src/main.rs"
+
+[dependencies]
+# The CE SDK: blobs/objects (put_object/get_object), atlas (host selection), mesh request/reply
+# (fan map tasks to hosts), content-addressing.
+ce-rs = { path = "../ce-rs" }
+# The capability verifier primitive — dataset-scoped query authorization (query:read), offline.
+ce-cap = { path = "../ce/crates/ce-cap" }
+# Identity: minting capability links + stable shard-host hashing keys; loaded from the CE data dir.
+ce-identity = { path = "../ce/crates/ce-identity" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+async-trait = "0.1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+proptest = "1"
