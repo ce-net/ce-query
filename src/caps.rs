@@ -51,8 +51,19 @@ impl Scope {
     }
 }
 
-/// Does this scope permit querying `dataset`? True iff the scope is empty (all) or names exactly
+/// Does this scope permit querying `dataset`? True iff the scope is empty (all) or names **exactly**
 /// `dataset`. This is the app caveat enforcement that `ce-cap` defers to the action.
+///
+/// EXACT match is deliberate and is the chosen, pinned semantics for this app. A dataset scope is a
+/// flat name with no hierarchical sub-structure, so there is no "scope `sales` covers `sales/q1`"
+/// relationship to honor. This is intentionally *stricter* than `ce-cap`'s `path_prefix` caveat,
+/// which narrows by raw prefix during attenuation: a chain may legitimately attenuate `path_prefix`
+/// from `""` (all) to `"sales"`, but it can never attenuate to a wider set, so the leaf scope this
+/// function sees is always at least as tight as every ancestor. Because we then require an exact
+/// equality here, a scope named `dataset` can never admit a sibling like `dataset-secret` (which a
+/// boundary-unaware `starts_with` would wrongly allow). The empty scope is the only widening, and it
+/// is explicit (all datasets under the owner). See the `scope_*` regression tests below, which pin
+/// that prefix-style and sibling names do NOT widen the scope.
 pub fn scope_allows(scope: &Scope, dataset: &str) -> bool {
     scope.dataset.is_empty() || scope.dataset == dataset
 }
@@ -166,6 +177,63 @@ mod tests {
         assert!(scope_allows(&Scope::all(), "anything"));
         assert!(scope_allows(&Scope::dataset("sales"), "sales"));
         assert!(!scope_allows(&Scope::dataset("sales"), "events"));
+    }
+
+    /// REGRESSION (review Theme A — prefix-match confusion): the dataset scope is matched by EXACT
+    /// equality, never by prefix. A scope named `dataset` must NOT admit a sibling whose name merely
+    /// shares that prefix (`dataset-secret`, `datasets`), which a boundary-unaware `starts_with`
+    /// check would wrongly allow. This pins the chosen semantics: prefix-style scopes do not widen.
+    #[test]
+    fn scope_exact_match_does_not_widen_to_siblings() {
+        let scope = Scope::dataset("dataset");
+        // The exact name is allowed.
+        assert!(scope_allows(&scope, "dataset"));
+        // Sibling names sharing the prefix must all be rejected.
+        for sibling in ["dataset-secret", "datasets", "dataset/secret", "dataset.bak", "datasetX"] {
+            assert!(
+                !scope_allows(&scope, sibling),
+                "exact-match scope `dataset` must NOT admit sibling `{sibling}`"
+            );
+        }
+        // A shorter name that the scope is a prefix-extension of must also be rejected.
+        assert!(!scope_allows(&Scope::dataset("dataset-secret"), "dataset"));
+    }
+
+    /// REGRESSION end-to-end: a minted, signed token scoped to `dataset` must be rejected by
+    /// [`verify`] when used against the sibling dataset `dataset-secret`. Guards the full
+    /// chain-check + app-scope path, not just the bare [`scope_allows`] predicate.
+    #[test]
+    fn verify_rejects_sibling_prefix_dataset() {
+        let owner = ident("owner-sibling");
+        let token = mint(&owner, owner.node_id(), &Scope::dataset("dataset"), 0, 7).unwrap();
+        for sibling in ["dataset-secret", "datasets", "dataset/secret"] {
+            let r = verify(
+                &owner.node_id(),
+                &[],
+                &[],
+                1000,
+                &owner.node_id(),
+                sibling,
+                &token,
+                &never_revoked,
+            );
+            assert!(
+                r.is_err(),
+                "scope `dataset` must reject sibling `{sibling}`, got {r:?}"
+            );
+        }
+        // ...while the exact dataset still verifies.
+        let ok = verify(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &owner.node_id(),
+            "dataset",
+            &token,
+            &never_revoked,
+        );
+        assert!(ok.is_ok(), "exact dataset must still verify: {ok:?}");
     }
 
     #[test]
