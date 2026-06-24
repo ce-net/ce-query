@@ -114,6 +114,31 @@ pub fn apply_limit(rows: &mut Vec<GroupResult>, limit: Option<usize>) {
     }
 }
 
+/// Sort raw projected rows in place by `order_by` (left-to-right key priority). Unlike
+/// [`order_rows`], a key here names a **row column** directly (projection queries have no group keys
+/// or aggregate outputs). A key naming an absent column compares every row equal on it (a stable
+/// no-op), and cells are compared with the same total, type-aware [`cell_cmp`]. Pure.
+pub fn order_raw_rows(rows: &mut [crate::dataset::Row], order_by: &[OrderKey]) {
+    if order_by.is_empty() {
+        return;
+    }
+    let null = serde_json::Value::Null;
+    rows.sort_by(|a, b| {
+        for OrderKey { column, dir } in order_by {
+            let av = a.get(column).unwrap_or(&null);
+            let bv = b.get(column).unwrap_or(&null);
+            let mut ord = cell_cmp(av, bv);
+            if *dir == OrderDir::Desc {
+                ord = ord.reverse();
+            }
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

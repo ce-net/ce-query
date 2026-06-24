@@ -45,16 +45,28 @@ pub struct MapRequest {
     pub grant: Option<String>,
 }
 
-/// The host's reply: either a partial aggregate or an error string the coordinator maps to a
-/// retryable [`MapError`].
+/// The host's reply: a partial aggregate (aggregate query), projected rows (projection query), or
+/// an error string the coordinator maps to a retryable [`MapError`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MapReply {
-    /// Successful map: the shard's partial aggregate.
+    /// Successful aggregate map: the shard's partial aggregate.
     Ok(Partial),
+    /// Successful projection: the shard's filtered, projected rows.
+    Rows(Vec<crate::dataset::Row>),
     /// The host refused or failed (unauthorized, missing blob, internal error). The coordinator
     /// fails over to the next host.
     Err(String),
 }
+
+/// The largest map request/reply payload the coordinator and host will accept, in bytes. Caps the
+/// memory a single AppRequest can pin on either side (hex-encoded on the wire, so ~2x this on
+/// transport). A request/reply over this is rejected rather than buffered — closing the OOM/DoS
+/// vector an unbounded payload would open.
+pub const MAX_MAP_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// The largest number of rows a single projection reply may carry, bounding per-shard result
+/// cardinality independently of byte size.
+pub const MAX_PROJECTION_ROWS: usize = 1_000_000;
 
 /// Coordinator-side map: fetch the shard blob and run the map locally. The simplest correct host —
 /// no remote agent required.
@@ -72,14 +84,39 @@ impl LocalMapHost {
 #[async_trait::async_trait]
 impl MapHost for LocalMapHost {
     async fn map(&self, _host_id: &str, shard: &Shard, query: &Query) -> Result<Partial, MapError> {
+        let rows = self.fetch_rows(shard).await?;
+        Ok(query.map_shard(&rows))
+    }
+
+    async fn project(
+        &self,
+        _host_id: &str,
+        shard: &Shard,
+        query: &Query,
+    ) -> Result<Vec<crate::dataset::Row>, MapError> {
+        let rows = self.fetch_rows(shard).await?;
+        Ok(query.project_shard(&rows))
+    }
+}
+
+impl LocalMapHost {
+    /// Fetch and decode a shard's rows, enforcing the payload size bound.
+    async fn fetch_rows(&self, shard: &Shard) -> Result<Vec<crate::dataset::Row>, MapError> {
         // Fetch the content-addressed shard object; get_object verifies every chunk against its CID.
         let bytes = self
             .client
             .get_object(&shard.cid)
             .await
             .map_err(|e| classify_fetch_error(&shard.cid, &e))?;
-        let rows = decode_shard(&bytes).map_err(|e| MapError::Corrupt(e.to_string()))?;
-        Ok(query.map_shard(&rows))
+        if bytes.len() > MAX_MAP_PAYLOAD_BYTES {
+            return Err(MapError::HostError(format!(
+                "shard {} is {} bytes, exceeds the {}-byte scan limit",
+                shard.cid,
+                bytes.len(),
+                MAX_MAP_PAYLOAD_BYTES
+            )));
+        }
+        decode_shard(&bytes).map_err(|e| MapError::Corrupt(e.to_string()))
     }
 }
 
@@ -100,21 +137,65 @@ impl MeshMapHost {
     }
 }
 
-#[async_trait::async_trait]
-impl MapHost for MeshMapHost {
-    async fn map(&self, host_id: &str, shard: &Shard, query: &Query) -> Result<Partial, MapError> {
+impl MeshMapHost {
+    /// Encode and send a map request, returning the decoded reply. Enforces the request payload
+    /// bound before sending (a request larger than the cap is the caller's bug or an attack).
+    async fn send(&self, host_id: &str, shard: &Shard, query: &Query) -> Result<MapReply, MapError> {
         let req = MapRequest { query: query.clone(), shard: shard.clone(), grant: self.grant.clone() };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| MapError::HostError(format!("encoding map request: {e}")))?;
+        if payload.len() > MAX_MAP_PAYLOAD_BYTES {
+            return Err(MapError::HostError(format!(
+                "map request is {} bytes, exceeds the {}-byte limit",
+                payload.len(),
+                MAX_MAP_PAYLOAD_BYTES
+            )));
+        }
         let reply_bytes = self
             .client
             .request(host_id, MAP_TOPIC, &payload, self.timeout_ms)
             .await
             .map_err(|e| classify_request_error(&e))?;
-        let reply: MapReply = serde_json::from_slice(&reply_bytes)
-            .map_err(|e| MapError::Corrupt(format!("decoding map reply: {e}")))?;
-        match reply {
+        if reply_bytes.len() > MAX_MAP_PAYLOAD_BYTES {
+            return Err(MapError::HostError(format!(
+                "map reply is {} bytes, exceeds the {}-byte limit",
+                reply_bytes.len(),
+                MAX_MAP_PAYLOAD_BYTES
+            )));
+        }
+        serde_json::from_slice(&reply_bytes)
+            .map_err(|e| MapError::Corrupt(format!("decoding map reply: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl MapHost for MeshMapHost {
+    async fn map(&self, host_id: &str, shard: &Shard, query: &Query) -> Result<Partial, MapError> {
+        match self.send(host_id, shard, query).await? {
             MapReply::Ok(p) => Ok(p),
+            MapReply::Rows(_) => Err(MapError::Corrupt("host returned rows for an aggregate query".into())),
+            MapReply::Err(msg) => Err(MapError::HostError(msg)),
+        }
+    }
+
+    async fn project(
+        &self,
+        host_id: &str,
+        shard: &Shard,
+        query: &Query,
+    ) -> Result<Vec<crate::dataset::Row>, MapError> {
+        match self.send(host_id, shard, query).await? {
+            MapReply::Rows(rows) => {
+                if rows.len() > MAX_PROJECTION_ROWS {
+                    return Err(MapError::HostError(format!(
+                        "projection reply has {} rows, exceeds the {}-row limit",
+                        rows.len(),
+                        MAX_PROJECTION_ROWS
+                    )));
+                }
+                Ok(rows)
+            }
+            MapReply::Ok(_) => Err(MapError::Corrupt("host returned a partial for a projection query".into())),
             MapReply::Err(msg) => Err(MapError::HostError(msg)),
         }
     }
@@ -132,15 +213,39 @@ pub async fn serve_map(
     if let Err(reason) = verify(req) {
         return MapReply::Err(format!("unauthorized: {reason}"));
     }
+    // Validate the query before doing any work — a malformed query is a clear rejection, not a panic.
+    if let Err(e) = req.query.validate() {
+        return MapReply::Err(format!("invalid query: {e}"));
+    }
     let bytes = match client.get_object(&req.shard.cid).await {
         Ok(b) => b,
         Err(e) => return MapReply::Err(format!("fetch {}: {e}", req.shard.cid)),
     };
+    if bytes.len() > MAX_MAP_PAYLOAD_BYTES {
+        return MapReply::Err(format!(
+            "shard {} is {} bytes, exceeds the {}-byte scan limit",
+            req.shard.cid,
+            bytes.len(),
+            MAX_MAP_PAYLOAD_BYTES
+        ));
+    }
     let rows = match decode_shard(&bytes) {
         Ok(r) => r,
         Err(e) => return MapReply::Err(format!("decode shard: {e}")),
     };
-    MapReply::Ok(req.query.map_shard(&rows))
+    if req.query.is_projection() {
+        let projected = req.query.project_shard(&rows);
+        if projected.len() > MAX_PROJECTION_ROWS {
+            return MapReply::Err(format!(
+                "projection produced {} rows, exceeds the {}-row limit",
+                projected.len(),
+                MAX_PROJECTION_ROWS
+            ));
+        }
+        MapReply::Rows(projected)
+    } else {
+        MapReply::Ok(req.query.map_shard(&rows))
+    }
 }
 
 /// Map a get_object error to a retryable [`MapError`], distinguishing a missing blob (404-ish) from
@@ -182,7 +287,7 @@ mod tests {
     #[test]
     fn map_request_reply_roundtrip() {
         let q = Query::new("t").agg(Agg::Count);
-        let shard = Shard { cid: "abc".into(), rows: 0, bytes: 0 };
+        let shard = Shard::new("abc", 0, 0);
         let req = MapRequest { query: q.clone(), shard: shard.clone(), grant: Some("tok".into()) };
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: MapRequest = serde_json::from_slice(&bytes).unwrap();
@@ -195,7 +300,7 @@ mod tests {
         let rb = serde_json::to_vec(&reply).unwrap();
         match serde_json::from_slice::<MapReply>(&rb).unwrap() {
             MapReply::Ok(p) => assert_eq!(p, partial),
-            MapReply::Err(_) => panic!("expected Ok"),
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
@@ -218,13 +323,39 @@ mod tests {
         let client = CeClient::local();
         let req = MapRequest {
             query: Query::new("t").agg(Agg::Count),
-            shard: Shard { cid: "cid".into(), rows: 0, bytes: 0 },
+            shard: Shard::new("cid", 0, 0),
             grant: None,
         };
         let reply = serve_map(&client, &req, |_| Err("no grant".into())).await;
         match reply {
             MapReply::Err(m) => assert!(m.contains("unauthorized"), "{m}"),
-            MapReply::Ok(_) => panic!("should have been rejected"),
+            other => panic!("should have been rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_reply_rows_roundtrip() {
+        let rows: Vec<crate::dataset::Row> = vec![row(1), row(2)];
+        let reply = MapReply::Rows(rows.clone());
+        let bytes = serde_json::to_vec(&reply).unwrap();
+        match serde_json::from_slice::<MapReply>(&bytes).unwrap() {
+            MapReply::Rows(r) => assert_eq!(r, rows),
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_map_rejects_invalid_query() {
+        let client = CeClient::local();
+        // A query with neither aggregates nor projection is invalid and must be rejected before fetch.
+        let req = MapRequest {
+            query: Query::new("t"),
+            shard: Shard::new("cid", 0, 0),
+            grant: None,
+        };
+        match serve_map(&client, &req, |_| Ok(())).await {
+            MapReply::Err(m) => assert!(m.contains("invalid query"), "{m}"),
+            _ => panic!("expected an invalid-query rejection"),
         }
     }
 

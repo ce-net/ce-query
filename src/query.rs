@@ -112,31 +112,34 @@ impl Agg {
         }
     }
 
-    /// A fresh zero-accumulator for this aggregate's identity element.
+    /// A fresh zero-accumulator for this aggregate's identity element. `Sum` starts in the lossless
+    /// integer lane ([`Accum::IntSum`]) and promotes to compensated float on the first fractional
+    /// value.
     pub fn zero(&self) -> Accum {
         match self {
             Agg::Count => Accum::Count(0),
-            Agg::Sum(_) => Accum::Sum(0.0),
+            Agg::Sum(_) => Accum::IntSum(0),
             Agg::Min(_) => Accum::Min(None),
             Agg::Max(_) => Accum::Max(None),
-            Agg::Avg(_) => Accum::Avg { sum: 0.0, count: 0 },
+            Agg::Avg(_) => Accum::Avg { sum: crate::combine::KahanSum::zero(), count: 0 },
         }
     }
 
     /// Fold one row's contribution into `acc`. Reads the row's field (none for `Count`); non-numeric
     /// or missing values are skipped for numeric aggregates so a single bad cell never corrupts the
-    /// result. Pure.
+    /// result. `SUM` stays in the exact integer lane while every value is integral and only then falls
+    /// back to compensated float. Pure.
     pub fn fold(&self, acc: &mut Accum, row: &Row) {
         match self {
             Agg::Count => {
                 if let Accum::Count(n) = acc {
-                    *n += 1;
+                    *n = n.saturating_add(1);
                 }
             }
             Agg::Sum(f) => {
-                if let (Accum::Sum(s), Some(v)) = (acc, row.get(f).and_then(as_f64)) {
-                    *s += v;
-                }
+                let Some(cell) = row.get(f) else { return };
+                let Some(num) = as_number(cell) else { return };
+                fold_sum(acc, num);
             }
             Agg::Min(f) => {
                 if let (Accum::Min(m), Some(v)) = (acc, row.get(f).and_then(as_f64)) {
@@ -150,11 +153,45 @@ impl Agg {
             }
             Agg::Avg(f) => {
                 if let (Accum::Avg { sum, count }, Some(v)) = (acc, row.get(f).and_then(as_f64)) {
-                    *sum += v;
-                    *count += 1;
+                    sum.add(v);
+                    *count = count.saturating_add(1);
                 }
             }
         }
+    }
+}
+
+/// A parsed numeric cell: an exact integer, or a float (for fractional / very-large-magnitude values).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Num {
+    /// An exact `i128` (the integer/money lane).
+    Int(i128),
+    /// A floating-point value (anything not exactly representable as `i128`).
+    Float(f64),
+}
+
+/// Fold one numeric value into a SUM accumulator, keeping the lossless integer lane while possible
+/// and otherwise promoting to compensated float.
+fn fold_sum(acc: &mut Accum, num: Num) {
+    match (&mut *acc, num) {
+        (Accum::IntSum(s), Num::Int(v)) => match s.checked_add(v) {
+            Some(t) => *s = t,
+            None => {
+                let mut k = crate::combine::KahanSum::zero();
+                k.add(*s as f64);
+                k.add(v as f64);
+                *acc = Accum::Sum(k);
+            }
+        },
+        (Accum::IntSum(s), Num::Float(v)) => {
+            let mut k = crate::combine::KahanSum::zero();
+            k.add(*s as f64);
+            k.add(v);
+            *acc = Accum::Sum(k);
+        }
+        (Accum::Sum(k), Num::Int(v)) => k.add(v as f64),
+        (Accum::Sum(k), Num::Float(v)) => k.add(v),
+        _ => {}
     }
 }
 
@@ -214,6 +251,12 @@ pub struct Query {
     /// `LIMIT` — keep at most this many result rows after ordering (`None` = unlimited).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// **Projection** columns for a non-aggregate `SELECT a, b FROM t WHERE …` query. When `Some`,
+    /// the query returns raw (filtered, projected) rows instead of aggregates — the single most
+    /// common BigQuery shape. `Some(vec![])` means `SELECT *` (all columns). Mutually exclusive with
+    /// `aggregates`/`group_by`: a query is either an aggregate query or a projection query.
+    #[serde(default)]
+    pub projection: Option<Vec<String>>,
 }
 
 impl Query {
@@ -226,7 +269,42 @@ impl Query {
             group_by: Vec::new(),
             order_by: Vec::new(),
             limit: None,
+            projection: None,
         }
+    }
+
+    /// Make this a **projection** query selecting `columns` (empty = `SELECT *`). Clears aggregates
+    /// and grouping — a projection and an aggregate query are distinct shapes.
+    pub fn project(mut self, columns: Vec<String>) -> Query {
+        self.aggregates.clear();
+        self.group_by.clear();
+        self.projection = Some(columns);
+        self
+    }
+
+    /// True if this is a projection (raw-row) query rather than an aggregate query.
+    pub fn is_projection(&self) -> bool {
+        self.projection.is_some()
+    }
+
+    /// **Project-map**: filter a shard's rows by the predicate and keep only the projected columns
+    /// (all columns when the projection list is empty). Pure and deterministic — the projection
+    /// analogue of [`Query::map_shard`], with predicate + column pruning applied during the scan so a
+    /// host ships only the rows and columns the query asked for.
+    pub fn project_shard(&self, rows: &[Row]) -> Vec<Row> {
+        let cols = self.projection.as_deref().unwrap_or(&[]);
+        rows.iter()
+            .filter(|r| self.predicate.eval(r))
+            .map(|r| {
+                if cols.is_empty() {
+                    r.clone()
+                } else {
+                    cols.iter()
+                        .filter_map(|c| r.get(c).map(|v| (c.clone(), v.clone())))
+                        .collect()
+                }
+            })
+            .collect()
     }
 
     /// Add an aggregate to the `SELECT` list (builder).
@@ -270,14 +348,27 @@ impl Query {
         rows
     }
 
-    /// Validate the query is runnable: it must request at least one aggregate. (A projection-only
-    /// query is a different, future code path — this engine is aggregate-first.)
+    /// Validate the query is runnable. It must name a dataset and be exactly one of:
+    /// - an **aggregate** query (at least one of COUNT/SUM/MIN/MAX/AVG), or
+    /// - a **projection** query (`SELECT a, b …` / `SELECT *`).
+    ///
+    /// A projection query may not also carry aggregates or `GROUP BY`; an aggregate query may not
+    /// carry a projection. These shapes are mutually exclusive.
     pub fn validate(&self) -> Result<()> {
         if self.dataset.trim().is_empty() {
             bail!("query has no dataset");
         }
+        if self.is_projection() {
+            if !self.aggregates.is_empty() {
+                bail!("a projection query cannot also select aggregates");
+            }
+            if !self.group_by.is_empty() {
+                bail!("a projection query cannot use GROUP BY (it returns raw rows)");
+            }
+            return Ok(());
+        }
         if self.aggregates.is_empty() {
-            bail!("query selects no aggregates (need at least one of COUNT/SUM/MIN/MAX/AVG)");
+            bail!("query selects no aggregates (need at least one of COUNT/SUM/MIN/MAX/AVG) or a projection");
         }
         Ok(())
     }
@@ -342,13 +433,69 @@ pub fn as_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// Coerce a JSON value to a [`Num`]: an exact integer when the value is an integral number (or a
+/// numeric string that parses as `i128`), otherwise a float. Returns `None` for non-numeric cells.
+/// This is what keeps SUM in the lossless integer lane for counts and money base units.
+pub fn as_number(v: &serde_json::Value) -> Option<Num> {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(Num::Int(i as i128))
+            } else if let Some(u) = n.as_u64() {
+                Some(Num::Int(u as i128))
+            } else {
+                n.as_f64().map(Num::Float)
+            }
+        }
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i128>() {
+                Some(Num::Int(i))
+            } else {
+                t.parse::<f64>().ok().map(Num::Float)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
         pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn as_number_classifies_int_vs_float() {
+        assert_eq!(as_number(&json!(42)), Some(Num::Int(42)));
+        assert_eq!(as_number(&json!(-7)), Some(Num::Int(-7)));
+        assert_eq!(as_number(&json!("100")), Some(Num::Int(100)));
+        assert_eq!(as_number(&json!(1.5)), Some(Num::Float(1.5)));
+        assert_eq!(as_number(&json!("2.5")), Some(Num::Float(2.5)));
+        assert_eq!(as_number(&json!("nope")), None);
+        assert_eq!(as_number(&json!(true)), None);
+    }
+
+    // The integer SUM lane is exact: summing many large integers via map_shard equals the plain i128
+    // sum, with no floating-point loss.
+    proptest! {
+        #[test]
+        fn integer_sum_is_exact(values in prop::collection::vec(-1_000_000_000_000i64..1_000_000_000_000, 0..50)) {
+            let q = Query::new("t").agg(Agg::Sum("v".into()));
+            let rows: Vec<Row> = values.iter().map(|&v| row(&[("v", json!(v))])).collect();
+            let out = q.map_shard(&rows).finalize();
+            let expected: i128 = values.iter().map(|&v| v as i128).sum();
+            if values.is_empty() {
+                // No rows -> no groups at all (a global aggregate over zero rows is the empty set).
+                prop_assert!(out.is_empty());
+            } else {
+                prop_assert_eq!(out[0].values["sum_v"].as_i64().map(|x| x as i128), Some(expected));
+            }
+        }
     }
 
     #[test]
@@ -395,7 +542,21 @@ mod tests {
         let out = p.finalize();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].values["count"], json!(3));
-        assert_eq!(out[0].values["sum_v"], json!(60.0));
+        // All-integer SUM finalises to an exact JSON integer (the money/int lane).
+        assert_eq!(out[0].values["sum_v"], json!(60));
+    }
+
+    #[test]
+    fn sum_stays_integer_lane_then_promotes_on_fraction() {
+        // Integers only -> exact integer result.
+        let q = Query::new("t").agg(Agg::Sum("v".into()));
+        let rows = vec![row(&[("v", json!(1_000_000_000_000i64))]); 3];
+        let out = q.map_shard(&rows).finalize();
+        assert_eq!(out[0].values["sum_v"], json!(3_000_000_000_000i64));
+        // A fractional value promotes the lane to float.
+        let rows2 = vec![row(&[("v", json!(1))]), row(&[("v", json!(0.5))])];
+        let out2 = q.map_shard(&rows2).finalize();
+        assert_eq!(out2[0].values["sum_v"], json!(1.5));
     }
 
     #[test]
@@ -443,7 +604,7 @@ mod tests {
         let q = Query::new("t").agg(Agg::Sum("v".into())).agg(Agg::Count);
         let out = q.map_shard(&rows).finalize();
         // sum skips the non-numeric, count includes every (filtered) row.
-        assert_eq!(out[0].values["sum_v"], json!(30.0));
+        assert_eq!(out[0].values["sum_v"], json!(30));
         assert_eq!(out[0].values["count"], json!(3));
     }
 
@@ -452,6 +613,47 @@ mod tests {
         assert!(Query::new("t").validate().is_err());
         assert!(Query::new("t").agg(Agg::Count).validate().is_ok());
         assert!(Query::new("").agg(Agg::Count).validate().is_err());
+    }
+
+    #[test]
+    fn projection_query_validates_and_maps() {
+        let q = Query::new("t").project(vec!["a".into(), "b".into()]);
+        assert!(q.is_projection());
+        assert!(q.validate().is_ok());
+        let rows = vec![
+            row(&[("a", json!(1)), ("b", json!("x")), ("c", json!(true))]),
+            row(&[("a", json!(2)), ("b", json!("y"))]),
+        ];
+        let out = q.project_shard(&rows);
+        assert_eq!(out.len(), 2);
+        // Only projected columns survive; absent columns are simply not present.
+        assert_eq!(out[0].get("a"), Some(&json!(1)));
+        assert_eq!(out[0].get("b"), Some(&json!("x")));
+        assert!(!out[0].contains_key("c"), "c was not projected");
+    }
+
+    #[test]
+    fn projection_star_keeps_all_columns_and_applies_where() {
+        let q = Query::new("t")
+            .project(vec![]) // SELECT *
+            .filter(Predicate::Cmp { field: "a".into(), op: CmpOp::Gt, value: json!(1) });
+        let rows = vec![
+            row(&[("a", json!(1)), ("b", json!("x"))]),
+            row(&[("a", json!(5)), ("b", json!("y"))]),
+        ];
+        let out = q.project_shard(&rows);
+        assert_eq!(out.len(), 1, "WHERE a > 1 keeps one row");
+        assert_eq!(out[0].get("a"), Some(&json!(5)));
+        assert_eq!(out[0].get("b"), Some(&json!("y")), "SELECT * keeps all columns");
+    }
+
+    #[test]
+    fn projection_and_aggregate_are_mutually_exclusive() {
+        // project() clears aggregates; adding an aggregate after still validates as long as
+        // projection is unset. A manually-constructed inconsistent query is rejected by validate().
+        let mut q = Query::new("t").agg(Agg::Count);
+        q.projection = Some(vec!["a".into()]);
+        assert!(q.validate().is_err(), "projection + aggregate must be rejected");
     }
 
     #[test]

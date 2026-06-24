@@ -30,8 +30,9 @@ ce-cap = { path = "../ce/crates/ce-cap" }
 # Identity: minting capability links + stable shard-host hashing keys; loaded from the CE data dir.
 ce-identity = { path = "../ce/crates/ce-identity" }
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 async-trait = "0.1"
+futures = "0.3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

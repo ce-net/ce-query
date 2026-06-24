@@ -18,13 +18,47 @@
 //! This module is pure (no network): it turns a host list into an assignment. The engine
 //! ([`crate::engine`]) executes it and, on failure, calls back here for the next candidate.
 
-use crate::dataset::Shard;
+use crate::dataset::{Shard, ShardStats};
+use crate::query::{CmpOp, Predicate, as_f64};
 use sha2::{Digest, Sha256};
+
+/// **Partition pruning**: can a shard with these `stats` possibly contain a row matching `predicate`?
+/// Returns `false` only when the shard can be *provably* skipped (its column range cannot satisfy a
+/// range comparison); returns `true` whenever there is any doubt (no stats, non-numeric literal, a
+/// negation, a missing column stat). Pruning is purely an optimisation: a `false` must be sound
+/// (never skip a shard that could match), while a conservative `true` only costs a needless scan.
+/// This is BigQuery's skip-on-stats efficiency, applied to NDJSON shards.
+pub fn shard_can_match(stats: Option<&ShardStats>, predicate: &Predicate) -> bool {
+    let Some(stats) = stats else { return true }; // no stats => never prune
+    can_match(stats, predicate)
+}
+
+fn can_match(stats: &ShardStats, predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::True => true,
+        Predicate::Not(_) => true, // negation flips ranges; be conservative and never prune
+        Predicate::Or(a, b) => can_match(stats, a) || can_match(stats, b),
+        Predicate::And(a, b) => can_match(stats, a) && can_match(stats, b),
+        Predicate::Cmp { field, op, value } => {
+            let Some(&(min, max)) = stats.numeric.get(field) else { return true };
+            let Some(v) = as_f64(value) else { return true }; // non-numeric comparison: don't prune
+            match op {
+                // The shard can match iff its [min,max] range overlaps the predicate's half-line.
+                CmpOp::Gt => max > v,
+                CmpOp::Ge => max >= v,
+                CmpOp::Lt => min < v,
+                CmpOp::Le => min <= v,
+                CmpOp::Eq => min <= v && v <= max,
+                CmpOp::Ne => true, // a single excluded value rarely empties a range; don't prune
+            }
+        }
+    }
+}
 
 /// A planned unit of work: one shard, the ranked host candidates (best-first), and the currently
 /// selected host index into that ranking. The engine starts at `attempt = 0` (the top-ranked host)
 /// and advances on failure via [`crate::plan::ShardTask::advance`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShardTask {
     /// The shard to map.
     pub shard: Shard,
@@ -117,11 +151,69 @@ mod tests {
     use proptest::prelude::*;
 
     fn shard(cid: &str) -> Shard {
-        Shard { cid: cid.to_string(), rows: 0, bytes: 0 }
+        Shard::new(cid, 0, 0)
     }
 
     fn hosts(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("host{i:02}")).collect()
+    }
+
+    fn stats(col: &str, min: f64, max: f64) -> ShardStats {
+        ShardStats { numeric: [(col.to_string(), (min, max))].into_iter().collect() }
+    }
+
+    #[test]
+    fn pruning_skips_provably_non_matching_shard() {
+        use serde_json::json;
+        let s = stats("v", 0.0, 10.0);
+        // WHERE v > 100: the shard maxes at 10, so it can never match -> prune.
+        let p = Predicate::Cmp { field: "v".into(), op: CmpOp::Gt, value: json!(100) };
+        assert!(!shard_can_match(Some(&s), &p));
+        // WHERE v > 5: 10 > 5, overlap -> keep.
+        let p2 = Predicate::Cmp { field: "v".into(), op: CmpOp::Gt, value: json!(5) };
+        assert!(shard_can_match(Some(&s), &p2));
+        // WHERE v < 0: min is 0, so 0 < 0 is false -> prune.
+        let p3 = Predicate::Cmp { field: "v".into(), op: CmpOp::Lt, value: json!(0) };
+        assert!(!shard_can_match(Some(&s), &p3));
+        // WHERE v = 5: in range -> keep; v = 50 -> prune.
+        assert!(shard_can_match(Some(&s), &Predicate::Cmp { field: "v".into(), op: CmpOp::Eq, value: json!(5) }));
+        assert!(!shard_can_match(Some(&s), &Predicate::Cmp { field: "v".into(), op: CmpOp::Eq, value: json!(50) }));
+    }
+
+    #[test]
+    fn pruning_is_conservative_without_stats_or_on_unknown_column() {
+        use serde_json::json;
+        let s = stats("v", 0.0, 10.0);
+        // No stats at all -> never prune.
+        let p = Predicate::Cmp { field: "v".into(), op: CmpOp::Gt, value: json!(100) };
+        assert!(shard_can_match(None, &p));
+        // A column with no stat -> never prune.
+        let other = Predicate::Cmp { field: "other".into(), op: CmpOp::Gt, value: json!(100) };
+        assert!(shard_can_match(Some(&s), &other));
+        // A non-numeric literal -> never prune.
+        let str_cmp = Predicate::Cmp { field: "v".into(), op: CmpOp::Eq, value: json!("x") };
+        assert!(shard_can_match(Some(&s), &str_cmp));
+        // A NOT is never pruned (range flips).
+        let neg = Predicate::Not(Box::new(p.clone()));
+        assert!(shard_can_match(Some(&s), &neg));
+    }
+
+    #[test]
+    fn pruning_and_or_compose() {
+        use serde_json::json;
+        let s = stats("v", 0.0, 10.0);
+        // (v > 100) AND (v < 5): the first conjunct prunes -> whole AND prunes.
+        let and = Predicate::And(
+            Box::new(Predicate::Cmp { field: "v".into(), op: CmpOp::Gt, value: json!(100) }),
+            Box::new(Predicate::Cmp { field: "v".into(), op: CmpOp::Lt, value: json!(5) }),
+        );
+        assert!(!shard_can_match(Some(&s), &and));
+        // (v > 100) OR (v < 5): the second disjunct can match -> keep.
+        let or = Predicate::Or(
+            Box::new(Predicate::Cmp { field: "v".into(), op: CmpOp::Gt, value: json!(100) }),
+            Box::new(Predicate::Cmp { field: "v".into(), op: CmpOp::Lt, value: json!(5) }),
+        );
+        assert!(shard_can_match(Some(&s), &or));
     }
 
     #[test]
@@ -213,6 +305,32 @@ mod tests {
             prop_assert_eq!(load.len(), nhosts);
             for (_h, count) in load {
                 prop_assert!(count as f64 <= fair * 3.0 + 5.0, "host overloaded: {} vs fair {}", count, fair);
+            }
+        }
+    }
+
+    // SOUNDNESS: pruning must never skip a shard that actually contains a matching row. For random
+    // value sets and a random threshold, compute the real min/max stats and check that whenever the
+    // shard genuinely has a row satisfying `v > t` (resp. `v < t`), `shard_can_match` keeps it.
+    proptest! {
+        #[test]
+        fn pruning_never_drops_a_matching_shard(
+            values in prop::collection::vec(-1000i64..1000, 1..40),
+            threshold in -1100i64..1100,
+            gt in any::<bool>(),
+        ) {
+            use serde_json::json;
+            let min = *values.iter().min().unwrap() as f64;
+            let max = *values.iter().max().unwrap() as f64;
+            let stats = ShardStats { numeric: [("v".to_string(), (min, max))].into_iter().collect() };
+            let op = if gt { CmpOp::Gt } else { CmpOp::Lt };
+            let pred = Predicate::Cmp { field: "v".into(), op, value: json!(threshold) };
+            let truly_matches = values.iter().any(|&v| if gt { v > threshold } else { v < threshold });
+            if truly_matches {
+                prop_assert!(
+                    shard_can_match(Some(&stats), &pred),
+                    "pruned a shard that has a matching row (op={:?}, t={})", op, threshold
+                );
             }
         }
     }

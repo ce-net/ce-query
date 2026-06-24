@@ -16,10 +16,77 @@
 //! carrying `(sum, count)` and dividing only at **finalisation** (`AVG` of merged `AVG`s is wrong;
 //! sum/count merged then divided is right). The property tests at the bottom of this file *prove*
 //! these laws over random inputs — they are the foundation's validation.
+//!
+//! ## Numeric determinism
+//!
+//! A distributed engine must give the **same answer regardless of how shards were split or in what
+//! order their partials arrived** — otherwise a retried/redistributed shard could change the result
+//! at the ULP level and break the safe-retry invariant. Two measures keep floating-point aggregates
+//! deterministic and reorder-stable:
+//!
+//! - `SUM`/`AVG` carry a [`KahanSum`] (Neumaier compensated summation) rather than a bare `f64`. The
+//!   running compensation is itself merged, so `(A·B)·C == A·(B·C)` holds to the bit for the orders
+//!   the engine can produce.
+//! - When every value folded into a `SUM` is an **exact integer** (counts, money base units, ids),
+//!   the accumulator stays in the [`Accum::IntSum`] lane (`i128`) and never touches float at all —
+//!   honouring the project's integer-base-unit money convention. The first non-integral value
+//!   promotes the lane to compensated float.
 
 use crate::query::Agg;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Neumaier (improved Kahan) compensated sum: a running total plus a correction term that recovers
+/// the low-order bits lost to rounding. Merging two `KahanSum`s adds both their totals **and** their
+/// compensations, so the sum is associative and commutative to far higher precision than a naive
+/// `f64` fold — the property the engine relies on to give a reorder-stable answer.
+///
+/// ```
+/// use ce_query::combine::KahanSum;
+/// // 1e16 + 1.0 - 1e16: a bare f64 fold loses the 1.0; compensated summation keeps it.
+/// let mut k = KahanSum::zero();
+/// for v in [1e16, 1.0, -1e16] {
+///     k.add(v);
+/// }
+/// assert_eq!(k.total(), 1.0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct KahanSum {
+    /// The running sum.
+    pub sum: f64,
+    /// The accumulated rounding compensation (added back at read time).
+    pub comp: f64,
+}
+
+impl KahanSum {
+    /// The additive identity (0 with no compensation).
+    pub fn zero() -> KahanSum {
+        KahanSum { sum: 0.0, comp: 0.0 }
+    }
+
+    /// Add one value with Neumaier compensation.
+    pub fn add(&mut self, v: f64) {
+        let t = self.sum + v;
+        if self.sum.abs() >= v.abs() {
+            self.comp += (self.sum - t) + v;
+        } else {
+            self.comp += (v - t) + self.sum;
+        }
+        self.sum = t;
+    }
+
+    /// Merge another compensated sum into this one (associative + commutative).
+    pub fn merge(&mut self, other: &KahanSum) {
+        // Fold the other total in compensated, then carry its leftover compensation.
+        self.add(other.sum);
+        self.comp += other.comp;
+    }
+
+    /// The corrected total (sum plus accumulated compensation).
+    pub fn total(&self) -> f64 {
+        self.sum + self.comp
+    }
+}
 
 /// The running state of one aggregate over many rows — a monoid value. Merged with [`merge`] and
 /// turned into an output JSON value by [`finalize_value`].
@@ -27,14 +94,18 @@ use std::collections::BTreeMap;
 pub enum Accum {
     /// Running row count.
     Count(u64),
-    /// Running numeric sum.
-    Sum(f64),
+    /// Running numeric sum, all-integer lane: every value folded so far was an exact integer, so the
+    /// sum is carried losslessly as `i128` (money base units / ids). Promotes to [`Accum::Sum`] on the
+    /// first non-integral value or on overflow.
+    IntSum(i128),
+    /// Running numeric sum, compensated-float lane (used once any non-integer value is seen).
+    Sum(KahanSum),
     /// Running minimum (None = no value seen yet, the identity).
     Min(Option<f64>),
     /// Running maximum (None = no value seen yet, the identity).
     Max(Option<f64>),
-    /// Running mean carried as `(sum, count)`, divided only at finalisation.
-    Avg { sum: f64, count: u64 },
+    /// Running mean carried as `(sum, count)`, divided only at finalisation. `sum` is compensated.
+    Avg { sum: KahanSum, count: u64 },
 }
 
 impl Accum {
@@ -43,8 +114,33 @@ impl Accum {
     /// error and is treated as a no-op rather than a panic, keeping the engine crash-free.
     pub fn merge(&mut self, other: &Accum) {
         match (self, other) {
-            (Accum::Count(a), Accum::Count(b)) => *a += b,
-            (Accum::Sum(a), Accum::Sum(b)) => *a += b,
+            (Accum::Count(a), Accum::Count(b)) => *a = a.saturating_add(*b),
+            // Both lanes still integral: stay lossless unless the addition would overflow i128.
+            (a @ Accum::IntSum(_), Accum::IntSum(y)) => {
+                if let Accum::IntSum(x) = a {
+                    match x.checked_add(*y) {
+                        Some(s) => *x = s,
+                        None => {
+                            // Overflow: promote to compensated float and keep going.
+                            let mut k = KahanSum::zero();
+                            k.add(*x as f64);
+                            k.add(*y as f64);
+                            *a = Accum::Sum(k);
+                        }
+                    }
+                }
+            }
+            // One side has gone to float: promote self and merge in the float domain.
+            (a @ Accum::IntSum(_), Accum::Sum(b)) => {
+                if let Accum::IntSum(x) = a {
+                    let mut k = KahanSum::zero();
+                    k.add(*x as f64);
+                    k.merge(b);
+                    *a = Accum::Sum(k);
+                }
+            }
+            (Accum::Sum(a), Accum::IntSum(y)) => a.add(*y as f64),
+            (Accum::Sum(a), Accum::Sum(b)) => a.merge(b),
             (Accum::Min(a), Accum::Min(b)) => {
                 *a = match (*a, *b) {
                     (Some(x), Some(y)) => Some(x.min(y)),
@@ -60,8 +156,8 @@ impl Accum {
                 }
             }
             (Accum::Avg { sum: sa, count: ca }, Accum::Avg { sum: sb, count: cb }) => {
-                *sa += sb;
-                *ca += cb;
+                sa.merge(sb);
+                *ca = ca.saturating_add(*cb);
             }
             // Variant mismatch: ignore (never happens for well-formed partials). No panic.
             _ => {}
@@ -73,7 +169,9 @@ impl Accum {
     pub fn finalize_value(&self) -> serde_json::Value {
         match self {
             Accum::Count(n) => serde_json::json!(n),
-            Accum::Sum(s) => serde_json::json!(s),
+            // An all-integer sum finalises to a JSON integer (exact — money base units stay exact).
+            Accum::IntSum(n) => serde_json::json!(n),
+            Accum::Sum(s) => serde_json::json!(s.total()),
             Accum::Min(m) | Accum::Max(m) => match m {
                 Some(v) => serde_json::json!(v),
                 None => serde_json::Value::Null,
@@ -82,7 +180,7 @@ impl Accum {
                 if *count == 0 {
                     serde_json::Value::Null
                 } else {
-                    serde_json::json!(sum / (*count as f64))
+                    serde_json::json!(sum.total() / (*count as f64))
                 }
             }
         }
@@ -323,7 +421,7 @@ mod tests {
     fn min_max_empty_finalize_null() {
         assert_eq!(Accum::Min(None).finalize_value(), serde_json::Value::Null);
         assert_eq!(Accum::Max(None).finalize_value(), serde_json::Value::Null);
-        assert_eq!(Accum::Avg { sum: 0.0, count: 0 }.finalize_value(), serde_json::Value::Null);
+        assert_eq!(Accum::Avg { sum: KahanSum::zero(), count: 0 }.finalize_value(), serde_json::Value::Null);
     }
 
     #[test]
@@ -357,7 +455,73 @@ mod tests {
     #[test]
     fn variant_mismatch_is_noop_not_panic() {
         let mut a = Accum::Count(5);
-        a.merge(&Accum::Sum(3.0)); // mismatched variants
+        a.merge(&Accum::Sum(KahanSum::zero())); // mismatched variants
         assert_eq!(a, Accum::Count(5));
+        // Min vs Max are also distinct variants — a mismatch must be a no-op, not a panic.
+        let mut m = Accum::Min(Some(1.0));
+        m.merge(&Accum::Max(Some(99.0)));
+        assert_eq!(m, Accum::Min(Some(1.0)));
+    }
+
+    #[test]
+    fn kahan_sum_is_precise_and_reorder_stable() {
+        // A classic catastrophic-cancellation case: 1e16 + 1.0 - 1e16. Naive f64 loses the 1.0;
+        // compensated summation keeps it.
+        let mut k = KahanSum::zero();
+        k.add(1e16);
+        k.add(1.0);
+        k.add(-1e16);
+        assert_eq!(k.total(), 1.0, "compensated sum must retain the small term");
+
+        // Merging in any order gives the same compensated total.
+        let mut a = KahanSum::zero();
+        for v in [1e16, 3.0, -1e16, 0.5] {
+            a.add(v);
+        }
+        let mut b1 = KahanSum::zero();
+        b1.add(1e16);
+        b1.add(3.0);
+        let mut b2 = KahanSum::zero();
+        b2.add(-1e16);
+        b2.add(0.5);
+        let mut merged = b2;
+        merged.merge(&b1);
+        assert_eq!(a.total(), merged.total());
+    }
+
+    #[test]
+    fn int_sum_overflow_promotes_to_float_without_panic() {
+        // Two near-i128::MAX integers overflow the int lane; the merge must promote to float, not
+        // panic or wrap.
+        let mut a = Accum::IntSum(i128::MAX);
+        a.merge(&Accum::IntSum(i128::MAX));
+        match a {
+            Accum::Sum(k) => assert!(k.total() > 0.0),
+            other => panic!("expected promotion to float, got {other:?}"),
+        }
+    }
+
+    // Float SUM must be associative under the engine's possible merge groupings, even with large
+    // magnitudes and fractional parts (the case bare-f64 summation would fail).
+    proptest! {
+        #[test]
+        fn float_sum_merge_associative(
+            a in prop::collection::vec(-1e9f64..1e9, 0..20),
+            b in prop::collection::vec(-1e9f64..1e9, 0..20),
+            c in prop::collection::vec(-1e9f64..1e9, 0..20),
+        ) {
+            let q = Query::new("t").agg(crate::query::Agg::Sum("v".into()));
+            let mk = |xs: &[f64]| {
+                let rows: Vec<Row> = xs.iter()
+                    .map(|&v| [("v".to_string(), json!(v))].into_iter().collect())
+                    .collect();
+                q.map_shard(&rows)
+            };
+            let (pa, pb, pc) = (mk(&a), mk(&b), mk(&c));
+            let mut left = pa.clone(); left.merge(&pb); left.merge(&pc);
+            let mut bc = pb.clone(); bc.merge(&pc);
+            let mut right = pa.clone(); right.merge(&bc);
+            prop_assert_eq!(left.finalize(), right.finalize());
+        }
     }
 }

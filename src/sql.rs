@@ -43,6 +43,14 @@ enum Tok {
     Str(String),
 }
 
+/// The parsed SELECT list: either aggregate functions or a raw-column projection.
+enum SelectList {
+    /// `SELECT COUNT(*), SUM(x), …` — the aggregate-first map-reduce shape.
+    Aggregates(Vec<Agg>),
+    /// `SELECT a, b` or `SELECT *` (empty vec) — a raw-row projection.
+    Projection(Vec<String>),
+}
+
 /// Split the input into tokens. Operators (`<=`, `>=`, `!=`, `<>`, `=`, `<`, `>`) and the comma and
 /// parens are their own tokens; quoted strings are captured whole. Whitespace separates words.
 fn tokenize(input: &str) -> Result<Vec<Tok>> {
@@ -146,7 +154,10 @@ impl Parser {
 
     fn parse_query(&mut self) -> Result<Query> {
         self.expect_kw("SELECT")?;
-        let aggregates = self.parse_agg_list()?;
+        // The SELECT list is either an aggregate list or a raw-column projection. We decide by
+        // looking ahead: a projection item is a bare identifier (or `*`) NOT immediately followed by
+        // `(`; an aggregate is `FUNC(arg)`.
+        let select = self.parse_select_list()?;
         self.expect_kw("FROM")?;
         let dataset = self
             .next_word()
@@ -186,7 +197,63 @@ impl Parser {
             None
         };
 
-        Ok(Query { dataset, aggregates, predicate, group_by, order_by, limit })
+        let query = match select {
+            SelectList::Aggregates(aggregates) => Query {
+                dataset,
+                aggregates,
+                predicate,
+                group_by,
+                order_by,
+                limit,
+                projection: None,
+            },
+            SelectList::Projection(columns) => {
+                if !group_by.is_empty() {
+                    bail!("GROUP BY is not allowed with a column projection (use aggregates)");
+                }
+                Query {
+                    dataset,
+                    aggregates: Vec::new(),
+                    predicate,
+                    group_by: Vec::new(),
+                    order_by,
+                    limit,
+                    projection: Some(columns),
+                }
+            }
+        };
+        Ok(query)
+    }
+
+    /// Parse the SELECT list, distinguishing an aggregate list from a raw-column projection. A
+    /// single `*` or a comma-list of bare identifiers (none followed by `(`) is a projection;
+    /// otherwise every item must be `FUNC(arg)`.
+    fn parse_select_list(&mut self) -> Result<SelectList> {
+        // `SELECT *` projection (all columns).
+        if self.peek().map(|w| w == "*").unwrap_or(false) {
+            self.pos += 1;
+            return Ok(SelectList::Projection(Vec::new()));
+        }
+        // Decide by peeking whether the first item is `ident (` (aggregate) or a bare column.
+        let is_agg_first = matches!(self.peek_tok(), Some(Tok::Word(w)) if !is_operator(w))
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Word(w)) if w == "(");
+        if is_agg_first {
+            return Ok(SelectList::Aggregates(self.parse_agg_list()?));
+        }
+        // Projection: comma-separated bare column names.
+        let mut cols = Vec::new();
+        loop {
+            let col = self
+                .next_word()
+                .ok_or_else(|| anyhow!("expected a column name in SELECT"))?;
+            cols.push(col);
+            if self.peek().map(|w| w == ",").unwrap_or(false) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(SelectList::Projection(cols))
     }
 
     /// Parse `ORDER BY <col> [ASC|DESC] [, <col> [ASC|DESC]]*`. Direction defaults to ascending.
@@ -528,6 +595,48 @@ mod tests {
         assert!(parse("SELECT COUNT(*) FROM t LIMIT abc").is_err()); // non-numeric
         assert!(parse("SELECT COUNT(*) FROM t LIMIT -1").is_err()); // negative
         assert!(parse("SELECT COUNT(*) FROM t ORDER BY count SIDEWAYS").is_err()); // trailing junk
+    }
+
+    #[test]
+    fn parse_projection_columns() {
+        let q = parse("SELECT a, b, c FROM t WHERE a > 1 LIMIT 10").unwrap();
+        assert!(q.is_projection());
+        assert_eq!(q.projection, Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert_eq!(q.limit, Some(10));
+        assert!(q.aggregates.is_empty());
+        match q.predicate {
+            Predicate::Cmp { ref field, .. } => assert_eq!(field, "a"),
+            _ => panic!("expected a predicate"),
+        }
+    }
+
+    #[test]
+    fn parse_select_star() {
+        let q = parse("SELECT * FROM events WHERE status >= 500").unwrap();
+        assert!(q.is_projection());
+        assert_eq!(q.projection, Some(vec![]));
+    }
+
+    #[test]
+    fn parse_projection_with_order_by() {
+        let q = parse("SELECT name, age FROM people ORDER BY age DESC LIMIT 3").unwrap();
+        assert_eq!(q.projection, Some(vec!["name".to_string(), "age".to_string()]));
+        assert_eq!(q.order_by, vec![OrderKey::desc("age")]);
+        assert_eq!(q.limit, Some(3));
+    }
+
+    #[test]
+    fn aggregate_still_parses_alongside_projection_support() {
+        // The aggregate path must be unaffected by the new projection branch.
+        let q = parse("SELECT COUNT(*), SUM(x) FROM t GROUP BY g").unwrap();
+        assert!(!q.is_projection());
+        assert_eq!(q.aggregates, vec![Agg::Count, Agg::Sum("x".into())]);
+    }
+
+    #[test]
+    fn projection_with_group_by_is_rejected() {
+        // A raw projection cannot also GROUP BY.
+        assert!(parse("SELECT a FROM t GROUP BY a").is_err());
     }
 
     #[test]

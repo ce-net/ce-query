@@ -14,13 +14,17 @@
 use anyhow::{Context, Result, bail};
 use ce_query::caps::{self, Scope};
 use ce_query::catalog::{Catalog, default_catalog_path};
-use ce_query::engine::{RunConfig, run};
+use ce_query::engine::{CostLimits, RunConfig, run};
 use ce_query::mesh::{LocalMapHost, MapRequest, MeshMapHost, serve_map};
 use ce_query::{discover_hosts, plan, register_dataset, sql};
 use ce_rs::CeClient;
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Parser)]
 #[command(
@@ -59,6 +63,24 @@ enum Cmd {
         /// Max hosts to try per shard before failing it.
         #[arg(long, default_value_t = 4)]
         max_attempts: usize,
+        /// Maximum shards mapped concurrently (fan-out width).
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        /// Redundancy factor K: map each shard on K hosts and require agreement (result verification).
+        #[arg(long, default_value_t = 1)]
+        redundancy: usize,
+        /// Agreeing copies required under redundancy (0 = unanimity).
+        #[arg(long, default_value_t = 0)]
+        quorum: usize,
+        /// Overall query deadline in milliseconds (0 = none).
+        #[arg(long, default_value_t = 0)]
+        deadline_ms: u64,
+        /// Maximum total bytes the query may scan (0 = the built-in default ceiling).
+        #[arg(long, default_value_t = 0)]
+        max_scan_bytes: u64,
+        /// Maximum total rows the query may scan (0 = the built-in default ceiling).
+        #[arg(long, default_value_t = 0)]
+        max_scan_rows: u64,
     },
     /// Show the shard-to-host assignment for a query without executing it.
     Plan {
@@ -87,6 +109,16 @@ enum Cmd {
         /// Poll interval in milliseconds for the inbox.
         #[arg(long, default_value_t = 500)]
         poll_ms: u64,
+        /// Seconds between refreshes of the on-chain revocation set (so revocations take effect on a
+        /// long-running agent without a restart).
+        #[arg(long, default_value_t = 30)]
+        revocation_refresh_secs: u64,
+        /// Additional accepted capability root node ids (hex), beyond this host's own key. Repeatable.
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        /// Maximum map requests handled concurrently (bounds head-of-line blocking and memory).
+        #[arg(long, default_value_t = 16)]
+        max_concurrent: usize,
     },
 }
 
@@ -132,19 +164,63 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Dataset { op } => dataset_cmd(op, &catalog_path, &cli.node).await,
-        Cmd::Run { sql, distributed, grant, max_attempts } => {
-            run_cmd(&sql, distributed, grant, max_attempts, &catalog_path, &cli.node).await
+        Cmd::Run {
+            sql,
+            distributed,
+            grant,
+            max_attempts,
+            concurrency,
+            redundancy,
+            quorum,
+            deadline_ms,
+            max_scan_bytes,
+            max_scan_rows,
+        } => {
+            let opts = RunOpts {
+                distributed,
+                grant,
+                max_attempts,
+                concurrency,
+                redundancy,
+                quorum,
+                deadline_ms,
+                max_scan_bytes,
+                max_scan_rows,
+            };
+            run_cmd(&sql, opts, &catalog_path, &cli.node).await
         }
         Cmd::Plan { sql } => plan_cmd(&sql, &catalog_path),
         Cmd::Grant { dataset, r#for, expires, nonce } => {
             grant_cmd(dataset, r#for, expires, nonce)
         }
-        Cmd::Serve { require_grant, poll_ms } => serve_cmd(require_grant, poll_ms, &cli.node).await,
+        Cmd::Serve { require_grant, poll_ms, revocation_refresh_secs, roots, max_concurrent } => {
+            serve_cmd(
+                require_grant,
+                poll_ms,
+                revocation_refresh_secs,
+                roots,
+                max_concurrent,
+                &cli.node,
+            )
+            .await
+        }
     }
 }
 
+/// Parsed `run` options, threaded into [`run_cmd`].
+struct RunOpts {
+    distributed: bool,
+    grant: Option<String>,
+    max_attempts: usize,
+    concurrency: usize,
+    redundancy: usize,
+    quorum: usize,
+    deadline_ms: u64,
+    max_scan_bytes: u64,
+    max_scan_rows: u64,
+}
+
 async fn dataset_cmd(op: DatasetCmd, catalog_path: &Path, node: &str) -> Result<()> {
-    let mut catalog = Catalog::load(catalog_path)?;
     match op {
         DatasetCmd::Add { name, from, shards } => {
             let bytes = std::fs::read(&from).with_context(|| format!("reading {from:?}"))?;
@@ -153,6 +229,8 @@ async fn dataset_cmd(op: DatasetCmd, catalog_path: &Path, node: &str) -> Result<
             if rows.is_empty() {
                 bail!("input {from:?} has no rows");
             }
+            // Upload shards (network I/O) before taking the catalog lock, so the lock is held only
+            // for the brief load-insert-save window.
             let client = CeClient::new(node.to_string());
             let ds = register_dataset(&client, &name, Vec::new(), &rows, shards).await?;
             println!(
@@ -164,19 +242,22 @@ async fn dataset_cmd(op: DatasetCmd, catalog_path: &Path, node: &str) -> Result<
             for (i, s) in ds.shards.iter().enumerate() {
                 println!("  shard[{i}] {} ({} rows, {} bytes)", s.cid, s.rows, s.bytes);
             }
-            catalog.put(ds);
-            catalog.save(catalog_path)?;
+            Catalog::mutate(catalog_path, |c| {
+                c.put(ds);
+                Ok(())
+            })?;
         }
         DatasetCmd::Ls => {
+            let catalog = Catalog::load(catalog_path)?;
             if catalog.datasets.is_empty() {
                 println!("(no datasets registered)");
             }
-            for name in catalog.names() {
-                let d = catalog.get(&name).expect("listed name exists");
+            for (name, d) in &catalog.datasets {
                 println!("{name}\t{} rows\t{} shards", d.total_rows(), d.shards.len());
             }
         }
         DatasetCmd::Show { name } => {
+            let catalog = Catalog::load(catalog_path)?;
             let d = catalog.require(&name)?;
             println!("dataset `{}`", d.name);
             println!("  rows:   {}", d.total_rows());
@@ -187,43 +268,78 @@ async fn dataset_cmd(op: DatasetCmd, catalog_path: &Path, node: &str) -> Result<
             }
         }
         DatasetCmd::Rm { name } => {
-            catalog.remove(&name)?;
-            catalog.save(catalog_path)?;
+            Catalog::mutate(catalog_path, |c| c.remove(&name).map(|_| ()))?;
             println!("removed dataset `{name}`");
         }
     }
     Ok(())
 }
 
-async fn run_cmd(
-    sql_str: &str,
-    distributed: bool,
-    grant: Option<String>,
-    max_attempts: usize,
-    catalog_path: &Path,
-    node: &str,
-) -> Result<()> {
+async fn run_cmd(sql_str: &str, opts: RunOpts, catalog_path: &Path, node: &str) -> Result<()> {
     let query = sql::parse(sql_str)?;
     let catalog = Catalog::load(catalog_path)?;
     let ds = catalog.require(&query.dataset)?.clone();
 
     let client = CeClient::new(node.to_string());
-    let hosts = discover_hosts(&client, distributed).await.unwrap_or_default();
+    let hosts = discover_hosts(&client, opts.distributed).await.unwrap_or_default();
     if hosts.is_empty() {
         bail!(
             "no candidate hosts found (atlas empty{}). Is the node running and mining?",
-            if distributed { " for the ce-query service" } else { "" }
+            if opts.distributed { " for the ce-query service" } else { "" }
         );
     }
 
-    let config = RunConfig { max_attempts_per_shard: max_attempts };
-    let report = if distributed {
-        let host = MeshMapHost::new(client.clone(), grant, 30_000);
-        run(&query, &ds.shards, &hosts, &host, &config).await?
-    } else {
-        let host = LocalMapHost::new(client.clone());
-        run(&query, &ds.shards, &hosts, &host, &config).await?
+    let mut limits = CostLimits::default();
+    if opts.max_scan_bytes != 0 {
+        limits.max_scan_bytes = opts.max_scan_bytes;
+    }
+    if opts.max_scan_rows != 0 {
+        limits.max_scan_rows = opts.max_scan_rows;
+    }
+    let config = RunConfig {
+        max_attempts_per_shard: opts.max_attempts,
+        max_in_flight: opts.concurrency,
+        redundancy: opts.redundancy,
+        quorum: opts.quorum,
+        deadline: if opts.deadline_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(opts.deadline_ms))
+        },
+        limits,
     };
+
+    // Build the chosen host implementation once, then dispatch projection vs aggregate.
+    enum Host {
+        Mesh(MeshMapHost),
+        Local(LocalMapHost),
+    }
+    let host = if opts.distributed {
+        Host::Mesh(MeshMapHost::new(client.clone(), opts.grant, 30_000))
+    } else {
+        Host::Local(LocalMapHost::new(client.clone()))
+    };
+    let map_host: &dyn ce_query::MapHost = match &host {
+        Host::Mesh(h) => h,
+        Host::Local(h) => h,
+    };
+
+    if query.is_projection() {
+        let report = ce_query::run_projection(&query, &ds.shards, &hosts, map_host, &config).await?;
+        let out: Vec<serde_json::Value> =
+            report.rows.iter().map(|r| serde_json::Value::Object(r.clone().into_iter().collect())).collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        eprintln!(
+            "[{} shard(s), {} attempt(s), {} row(s){}]",
+            ds.shards.len(),
+            report.total_attempts,
+            report.rows.len(),
+            if report.truncated { ", truncated" } else { "" }
+        );
+        return Ok(());
+    }
+
+    let report = run(&query, &ds.shards, &hosts, map_host, &config).await?;
 
     // Emit results as a JSON array (one object per group), plus a diagnostics line on stderr.
     let out: Vec<serde_json::Value> = report
@@ -242,10 +358,11 @@ async fn run_cmd(
         .collect();
     println!("{}", serde_json::to_string_pretty(&out)?);
     eprintln!(
-        "[{} shard(s), {} attempt(s), {} redistributed]",
+        "[{} shard(s), {} attempt(s), {} redistributed, {} verified]",
         ds.shards.len(),
         report.total_attempts,
-        report.redistributed
+        report.redistributed,
+        report.verified
     );
     Ok(())
 }
@@ -289,17 +406,50 @@ fn grant_cmd(dataset: Option<String>, audience: Option<String>, expires: u64, no
     Ok(())
 }
 
-async fn serve_cmd(require_grant: bool, poll_ms: u64, node: &str) -> Result<()> {
+async fn serve_cmd(
+    require_grant: bool,
+    poll_ms: u64,
+    revocation_refresh_secs: u64,
+    roots_hex: Vec<String>,
+    max_concurrent: usize,
+    node: &str,
+) -> Result<()> {
     let client = CeClient::new(node.to_string());
     let identity = load_identity()?;
     let self_id = identity.node_id();
 
+    // Parse the accepted capability roots (beyond this host's own key).
+    let mut accepted_roots = Vec::new();
+    for r in &roots_hex {
+        accepted_roots.push(parse_node_id(r).with_context(|| format!("parsing --root `{r}`"))?);
+    }
+    let accepted_roots = Arc::new(accepted_roots);
+
+    // The on-chain revocation set, refreshed periodically so a revocation takes effect on a long-
+    // running agent without a restart. Keyed by (issuer NodeId, nonce).
+    let revoked: Arc<Mutex<HashSet<(ce_identity::NodeId, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+    let last_refresh = Arc::new(AtomicU64::new(0));
+    refresh_revocations(&client, &revoked).await;
+    last_refresh.store(now_secs(), Ordering::Relaxed);
+
     // Advertise the service and subscribe to the map topic so requests reach our inbox.
     client.advertise_service(ce_query::mesh::QUERY_SERVICE).await.ok();
     client.subscribe(ce_query::mesh::MAP_TOPIC).await.ok();
-    tracing::info!(topic = %ce_query::mesh::MAP_TOPIC, "ce-query map agent serving");
+    tracing::info!(topic = %ce_query::mesh::MAP_TOPIC, require_grant, "ce-query map agent serving");
+
+    let client = Arc::new(client);
+    let self_id = Arc::new(self_id);
+    let limiter = Arc::new(Semaphore::new(max_concurrent.max(1)));
 
     loop {
+        // Refresh the revocation set on its interval (cheap, off the hot path).
+        if revocation_refresh_secs != 0
+            && now_secs().saturating_sub(last_refresh.load(Ordering::Relaxed)) >= revocation_refresh_secs
+        {
+            refresh_revocations(&client, &revoked).await;
+            last_refresh.store(now_secs(), Ordering::Relaxed);
+        }
+
         let messages = client.messages().await.unwrap_or_default();
         for msg in messages {
             if msg.topic != ce_query::mesh::MAP_TOPIC {
@@ -313,6 +463,15 @@ async fn serve_cmd(require_grant: bool, poll_ms: u64, node: &str) -> Result<()> 
                     continue;
                 }
             };
+            // Bound request body size before deserialization (DoS guard).
+            if payload.len() > ce_query::mesh::MAX_MAP_PAYLOAD_BYTES {
+                tracing::warn!(bytes = payload.len(), "oversized map request rejected");
+                let reply = ce_query::mesh::MapReply::Err("request too large".into());
+                if let Ok(bytes) = serde_json::to_vec(&reply) {
+                    let _ = client.reply(token, &bytes).await;
+                }
+                continue;
+            }
             let req: MapRequest = match serde_json::from_slice(&payload) {
                 Ok(r) => r,
                 Err(e) => {
@@ -321,30 +480,75 @@ async fn serve_cmd(require_grant: bool, poll_ms: u64, node: &str) -> Result<()> 
                 }
             };
             let requester = parse_node_id(&msg.from).ok();
-            let reply = serve_map(&client, &req, |r| {
-                if !require_grant {
-                    return Ok(());
+
+            // Handle each request concurrently (bounded), so one slow shard fetch does not block the
+            // whole inbox (head-of-line blocking).
+            let permit = match Arc::clone(&limiter).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let client = Arc::clone(&client);
+            let self_id = Arc::clone(&self_id);
+            let roots = Arc::clone(&accepted_roots);
+            let revoked = Arc::clone(&revoked);
+            tokio::spawn(async move {
+                let _permit = permit; // held for the duration of the request
+                let revoked_set = revoked.lock().await.clone();
+                let reply = serve_map(&client, &req, |r| {
+                    if !require_grant {
+                        return Ok(());
+                    }
+                    let req_id = requester.ok_or_else(|| "unknown requester".to_string())?;
+                    let grant = r.grant.as_deref().ok_or_else(|| "grant required".to_string())?;
+                    caps::verify(
+                        &self_id,
+                        &roots,
+                        &[],
+                        now_secs(),
+                        &req_id,
+                        &r.query.dataset,
+                        grant,
+                        &|issuer: &ce_identity::NodeId, nonce: u64| {
+                            revoked_set.contains(&(*issuer, nonce))
+                        },
+                    )
+                })
+                .await;
+                // Surface a serialization failure as a host error rather than replying with empty
+                // bytes (which the coordinator would mis-decode as Corrupt).
+                let reply_bytes = match serde_json::to_vec(&reply) {
+                    Ok(b) => b,
+                    Err(e) => serde_json::to_vec(&ce_query::mesh::MapReply::Err(format!(
+                        "encoding reply: {e}"
+                    )))
+                    .unwrap_or_else(|_| b"{\"Err\":\"encode failure\"}".to_vec()),
+                };
+                if let Err(e) = client.reply(token, &reply_bytes).await {
+                    tracing::warn!(err = %e, "failed to send reply");
                 }
-                let req_id = requester.ok_or_else(|| "unknown requester".to_string())?;
-                let grant = r.grant.as_deref().ok_or_else(|| "grant required".to_string())?;
-                caps::verify(
-                    &self_id,
-                    &[],
-                    &[],
-                    now_secs(),
-                    &req_id,
-                    &r.query.dataset,
-                    grant,
-                    &|_, _| false,
-                )
-            })
-            .await;
-            let reply_bytes = serde_json::to_vec(&reply).unwrap_or_default();
-            if let Err(e) = client.reply(token, &reply_bytes).await {
-                tracing::warn!(err = %e, "failed to send reply");
-            }
+            });
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+    }
+}
+
+/// Refresh the in-memory revocation set from the node's on-chain revocation list. Issuer ids that do
+/// not parse as 64-hex are skipped (malformed entries can never match a real chain).
+async fn refresh_revocations(
+    client: &CeClient,
+    revoked: &Mutex<HashSet<(ce_identity::NodeId, u64)>>,
+) {
+    match client.revoked().await {
+        Ok(list) => {
+            let mut set = HashSet::with_capacity(list.len());
+            for (issuer_hex, nonce) in list {
+                if let Ok(id) = parse_node_id(&issuer_hex) {
+                    set.insert((id, nonce));
+                }
+            }
+            *revoked.lock().await = set;
+        }
+        Err(e) => tracing::warn!(err = %e, "could not refresh revocation set; keeping previous"),
     }
 }
 

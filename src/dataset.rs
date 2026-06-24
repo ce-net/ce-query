@@ -27,8 +27,21 @@ use std::collections::BTreeMap;
 /// serialization is deterministic — its bytes (and therefore a shard's CID) are stable across runs.
 pub type Row = BTreeMap<String, serde_json::Value>;
 
+/// Per-column min/max statistics for a shard, used for **partition pruning**: if a query's `WHERE`
+/// range cannot overlap a column's `[min, max]` in a shard, the planner can skip that shard entirely
+/// without fetching it — BigQuery's core efficiency story (scan only the partitions that can match).
+/// Stats are recorded over numeric columns only (the comparable lane); a column with any
+/// non-numeric value in the shard is omitted (no stat = the shard is never pruned on it, which is
+/// safe — pruning only ever *removes* provably-non-matching shards).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ShardStats {
+    /// Column name -> (min, max) of its numeric values within the shard.
+    #[serde(default)]
+    pub numeric: BTreeMap<String, (f64, f64)>,
+}
+
 /// A single shard's descriptor: the blob CID plus counts used by the planner to balance work.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shard {
     /// Content id (hex sha256 manifest CID) of the blob holding this shard's NDJSON rows.
     pub cid: String,
@@ -38,10 +51,20 @@ pub struct Shard {
     /// Encoded byte length of the shard (0 if unknown).
     #[serde(default)]
     pub bytes: u64,
+    /// Optional per-column min/max stats for partition pruning (`None` = no stats, never pruned).
+    #[serde(default)]
+    pub stats: Option<ShardStats>,
+}
+
+impl Shard {
+    /// A shard descriptor with the given CID and counts and no stats.
+    pub fn new(cid: impl Into<String>, rows: u64, bytes: u64) -> Shard {
+        Shard { cid: cid.into(), rows, bytes, stats: None }
+    }
 }
 
 /// A dataset: name + schema + ordered shard list. Pure metadata; rows live in the referenced blobs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dataset {
     /// Logical table name (unique within a catalog).
     pub name: String,
@@ -70,11 +93,75 @@ impl Dataset {
         self.shards.iter().map(|s| s.bytes).sum()
     }
 
-    /// Append a shard (by CID + counts). Returns the new shard index.
+    /// Append a shard (by CID + counts) with no stats. Returns the new shard index.
     pub fn add_shard(&mut self, cid: impl Into<String>, rows: u64, bytes: u64) -> usize {
-        self.shards.push(Shard { cid: cid.into(), rows, bytes });
+        self.shards.push(Shard { cid: cid.into(), rows, bytes, stats: None });
         self.shards.len() - 1
     }
+
+    /// Append a shard with computed min/max stats. Returns the new shard index.
+    pub fn add_shard_with_stats(
+        &mut self,
+        cid: impl Into<String>,
+        rows: u64,
+        bytes: u64,
+        stats: ShardStats,
+    ) -> usize {
+        self.shards.push(Shard { cid: cid.into(), rows, bytes, stats: Some(stats) });
+        self.shards.len() - 1
+    }
+}
+
+/// Compute per-column numeric min/max statistics for a shard's rows. A column is recorded only if
+/// **every** value present for it across the rows is numeric (mixed-type columns are skipped so a
+/// pruning decision is never made on an incomparable column). Used to populate [`Shard::stats`] at
+/// registration time for partition pruning.
+pub fn compute_stats(rows: &[Row]) -> ShardStats {
+    use crate::query::as_f64;
+    let mut numeric: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    let mut disqualified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in rows {
+        for (col, val) in row {
+            if disqualified.contains(col) {
+                continue;
+            }
+            match as_f64(val) {
+                Some(v) => {
+                    let e = numeric.entry(col.clone()).or_insert((v, v));
+                    e.0 = e.0.min(v);
+                    e.1 = e.1.max(v);
+                }
+                None => {
+                    // A non-numeric value in this column disqualifies it from numeric stats.
+                    numeric.remove(col);
+                    disqualified.insert(col.clone());
+                }
+            }
+        }
+    }
+    ShardStats { numeric }
+}
+
+/// The maximum length of a dataset name, and the allowed charset. Names key the catalog map and the
+/// capability `path_prefix` scope, so they are restricted to a safe, filesystem/identifier-friendly
+/// set: ASCII alphanumerics plus `_ - . :`. This rejects whitespace, path separators, and control
+/// characters that could confuse scope matching or catalog persistence.
+pub const MAX_DATASET_NAME_LEN: usize = 128;
+
+/// Validate a dataset name: non-empty, within [`MAX_DATASET_NAME_LEN`], and drawn only from
+/// `[A-Za-z0-9_.:-]`. Returns the trimmed name on success or a clear error.
+pub fn validate_dataset_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("dataset name is empty");
+    }
+    if name.len() > MAX_DATASET_NAME_LEN {
+        bail!("dataset name is {} chars, exceeds the {MAX_DATASET_NAME_LEN}-char limit", name.len());
+    }
+    if let Some(bad) = name.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))) {
+        bail!("dataset name contains an invalid character `{bad}` (allowed: A-Z a-z 0-9 _ - . :)");
+    }
+    Ok(name.to_string())
 }
 
 /// Encode a slice of rows as NDJSON bytes — one compact JSON object per line. This is the canonical
@@ -211,6 +298,51 @@ mod tests {
     #[test]
     fn shard_rows_zero_count_errors() {
         assert!(shard_rows(&[], 0).is_err());
+    }
+
+    #[test]
+    fn dataset_name_validation() {
+        assert_eq!(validate_dataset_name("sales").unwrap(), "sales");
+        assert_eq!(validate_dataset_name("  logs_2026.q1 ").unwrap(), "logs_2026.q1");
+        assert!(validate_dataset_name("").is_err());
+        assert!(validate_dataset_name("   ").is_err());
+        assert!(validate_dataset_name("bad name").is_err()); // whitespace
+        assert!(validate_dataset_name("../etc/passwd").is_err()); // path traversal
+        assert!(validate_dataset_name("a/b").is_err()); // separator
+        assert!(validate_dataset_name(&"x".repeat(MAX_DATASET_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn compute_stats_records_numeric_min_max() {
+        let rows = vec![
+            row(&[("v", json!(5)), ("t", json!("a"))]),
+            row(&[("v", json!(1)), ("t", json!("b"))]),
+            row(&[("v", json!(9)), ("t", json!("c"))]),
+        ];
+        let s = compute_stats(&rows);
+        assert_eq!(s.numeric.get("v"), Some(&(1.0, 9.0)));
+        // `t` is a string column -> no numeric stat.
+        assert!(!s.numeric.contains_key("t"));
+    }
+
+    #[test]
+    fn compute_stats_disqualifies_mixed_type_column() {
+        // A column that is numeric in one row and a string in another is omitted (can't prune on it).
+        let rows = vec![
+            row(&[("v", json!(5))]),
+            row(&[("v", json!("oops"))]),
+            row(&[("v", json!(9))]),
+        ];
+        let s = compute_stats(&rows);
+        assert!(!s.numeric.contains_key("v"), "mixed-type column must be disqualified");
+    }
+
+    #[test]
+    fn add_shard_with_stats_roundtrips() {
+        let mut d = Dataset::new("t", vec![]);
+        let stats = ShardStats { numeric: [("v".to_string(), (0.0, 10.0))].into_iter().collect() };
+        d.add_shard_with_stats("cid", 5, 50, stats.clone());
+        assert_eq!(d.shards[0].stats, Some(stats));
     }
 
     #[test]

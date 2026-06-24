@@ -28,6 +28,13 @@
 //! seam is the [`engine::MapHost`] trait, with a coordinator-local ([`mesh::LocalMapHost`]) and a
 //! true-distributed ([`mesh::MeshMapHost`]) implementation.
 //!
+//! Beyond the core, the engine fans shards **concurrently** (bounded), enforces **cost limits** and a
+//! **deadline**, can **verify results by redundancy/quorum** (catching a lying host on an open mesh),
+//! and **prunes partitions** via per-shard min/max stats. Non-aggregate **projection** queries
+//! (`SELECT a, b … `) run through [`engine::run_projection`] with predicate/column pushdown.
+//! Aggregates are **numerically safe**: `SUM` stays in an exact `i128` lane for integers/money and
+//! uses Neumaier-compensated summation otherwise, so the answer is reorder-stable.
+//!
 //! ```no_run
 //! use ce_query::{Query, query::Agg, sql};
 //! # async fn demo() -> anyhow::Result<()> {
@@ -53,8 +60,11 @@ pub mod sql;
 
 pub use catalog::Catalog;
 pub use combine::{Accum, GroupResult, Partial};
-pub use dataset::{Dataset, Row, Shard};
-pub use engine::{MapError, MapHost, RunConfig, RunReport, run};
+pub use dataset::{Dataset, Row, Shard, ShardStats, compute_stats};
+pub use engine::{
+    CostError, CostLimits, MapError, MapHost, ProjectionReport, RunConfig, RunReport, run,
+    run_projection,
+};
 pub use join::{JoinKeys, distributed_join, hash_join};
 pub use query::{Agg, CmpOp, OrderDir, OrderKey, Predicate, Query};
 
@@ -75,7 +85,10 @@ pub async fn register_dataset(
     rows: &[Row],
     shard_count: usize,
 ) -> Result<Dataset> {
-    let name = name.into();
+    let name = dataset::validate_dataset_name(&name.into())?;
+    if shard_count == 0 {
+        anyhow::bail!("shard_count must be positive");
+    }
     let mut ds = Dataset::new(name.clone(), schema);
     let parts = dataset::shard_rows(rows, shard_count).context("sharding rows")?;
     for (shard_rows, bytes) in parts {
@@ -87,7 +100,9 @@ pub async fn register_dataset(
             .put_object(&bytes)
             .await
             .with_context(|| format!("uploading a shard of dataset `{name}`"))?;
-        ds.add_shard(cid, shard_rows.len() as u64, bytes.len() as u64);
+        // Record per-column min/max stats so the planner can prune shards a WHERE range cannot match.
+        let stats = dataset::compute_stats(&shard_rows);
+        ds.add_shard_with_stats(cid, shard_rows.len() as u64, bytes.len() as u64, stats);
     }
     Ok(ds)
 }

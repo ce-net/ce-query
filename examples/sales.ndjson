@@ -1,0 +1,10 @@
+{"region":"EU","product":"widget","amount":120,"latency_ms":12}
+{"region":"US","product":"widget","amount":340,"latency_ms":8}
+{"region":"EU","product":"gadget","amount":55,"latency_ms":21}
+{"region":"US","product":"gadget","amount":210,"latency_ms":15}
+{"region":"APAC","product":"widget","amount":90,"latency_ms":33}
+{"region":"EU","product":"widget","amount":75,"latency_ms":9}
+{"region":"US","product":"gizmo","amount":410,"latency_ms":42}
+{"region":"APAC","product":"gadget","amount":30,"latency_ms":51}
+{"region":"EU","product":"gizmo","amount":260,"latency_ms":18}
+{"region":"US","product":"widget","amount":180,"latency_ms":7}
