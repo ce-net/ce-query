@@ -5,7 +5,7 @@
 //! allowed to query that dataset *before* fetching shards and burning CPU. The answer is a signed,
 //! attenuating `ce-cap` chain: the dataset owner mints a capability whose ability is `query:read`,
 //! whose resource is the owning node, and whose `path_prefix` caveat names the dataset. The host
-//! verifies it offline in microseconds via [`ce_cap::authorize`] — no policy server, no shared
+//! verifies it offline in microseconds via [`ce_iam_core::authorize`] — no policy server, no shared
 //! secret — and a holder can attenuate it (narrow to one dataset, add an expiry) and re-delegate.
 //!
 //! Ability used by this app (opaque to `ce-cap`):
@@ -16,7 +16,7 @@
 //! enforces the dataset match ([`scope_allows`]) on top of the `ce-cap` chain check.
 
 use anyhow::{Context, Result};
-use ce_cap::{Caveats, Resource, SignedCapability};
+use ce_iam_core::{Caveats, Resource, SignedCapability};
 use ce_identity::{Identity, NodeId};
 
 /// Ability string: run queries over the scoped dataset(s).
@@ -96,13 +96,13 @@ pub fn mint(
         nonce,
         None,
     );
-    Ok(ce_cap::encode_chain(&[cap]))
+    Ok(ce_iam_core::encode_chain(&[cap]))
 }
 
 /// Decode a token into its leaf abilities and dataset scope for inspection. Does not verify the
 /// signature/expiry — call [`verify`] for that.
 pub fn inspect(token: &str) -> Result<(Vec<String>, Scope)> {
-    let chain = ce_cap::decode_chain(token).context("decoding query capability")?;
+    let chain = ce_iam_core::decode_chain(token).context("decoding query capability")?;
     let leaf = chain.last().context("empty capability chain")?;
     let scope = leaf
         .cap
@@ -130,8 +130,8 @@ pub fn verify(
     token: &str,
     is_revoked: &dyn Fn(&NodeId, u64) -> bool,
 ) -> Result<(), String> {
-    let chain = ce_cap::decode_chain(token).map_err(|e| e.to_string())?;
-    ce_cap::authorize(
+    let chain = ce_iam_core::decode_chain(token).map_err(|e| e.to_string())?;
+    ce_iam_core::authorize(
         self_id,
         accepted_roots,
         self_tags,

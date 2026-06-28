@@ -24,11 +24,11 @@ path = "src/main.rs"
 [dependencies]
 # The CE SDK: blobs/objects (put_object/get_object), atlas (host selection), mesh request/reply
 # (fan map tasks to hosts), content-addressing.
-ce-rs = { path = "../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 # The capability verifier primitive — dataset-scoped query authorization (query:read), offline.
-ce-cap = { path = "../ce/crates/ce-cap" }
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
 # Identity: minting capability links + stable shard-host hashing keys; loaded from the CE data dir.
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 async-trait = "0.1"
